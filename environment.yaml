@@ -1,0 +1,35 @@
+name: as_bbo
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+
+dependencies:
+  - python=3.10
+  - pip
+
+  # Core scientific stack
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - tqdm
+
+  # Training
+  - pytorch
+  - pytorch-cuda
+  - tensorboard
+
+  # Notebooks + plotting (used by .ipynb and data_generation scripts)
+  - ipython
+  - ipykernel
+  - jupyter
+  - matplotlib
+  - seaborn
+
+  # COCO/BBOB tooling (used by ERT_cal.ipynb and data_generation/auxiliary_functions.py)
+  # Not available on conda-forge as of writing; install via pip if you need those notebooks/scripts.
+  # - pip:
+  #   - cocopp
+  #   - cocoex
