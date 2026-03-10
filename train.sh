@@ -24,8 +24,8 @@ ELL_MAX="0.7"
 LOG_UNIFORM_SCALE="true"
 
 PROTOCOLS=("lpo" "lio" "random")                # "lpo", "lio", or "random"
-CSV="data/relert_bbob_10.csv"      # protocol CSV file
-DATA_ROOT="data/bbob/maxscale_${ELL_MAX}_logscale_${LOG_UNIFORM_SCALE}/"
+CSV="/data1/home/jw1017/AS_BBO_REBUILT/data/bbob_by_deepela/relert.csv"      # protocol CSV file
+DATA_ROOT="/data1/home/jw1017/AS_BBO_REBUILT/data/bbob_by_deepela//maxscale_${ELL_MAX}_logscale_${LOG_UNIFORM_SCALE}/"
 RESOLUTIONS=(8)
 KS_VIEWS=(32)
 NUM_REPETITIONS="10"

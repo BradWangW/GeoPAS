@@ -33,7 +33,7 @@ log_uniform_scale = True
 use_processes = True
 n_workers = max(1, mp.cpu_count() - 1)
 
-out_dir = f"data/bbob/maxscale_{ell_max}_logscale_{str(log_uniform_scale).lower()}"
+out_dir = f"/data1/home/jw1017/AS_BBO_REBUILT/data/bbob_by_deepela/maxscale_{ell_max}_logscale_{str(log_uniform_scale).lower()}"
 
 print(f"Repetitions: {num_repetitions}")
 print(f"Workers: {n_workers} processes")
