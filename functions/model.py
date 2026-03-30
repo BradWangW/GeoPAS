@@ -3,22 +3,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class ContourCNNSelector(nn.Module):
-    def __init__(self, num_algorithms, *, dual_head: bool = True):
+    def __init__(self, num_algorithms, *, dual_head: bool = True, conv_channels=[32, 64, 128]):
         super().__init__()
 
         self.dual_head = bool(dual_head)
 
-        self.encoder = PlotEncoder()
+        self.encoder = PlotEncoder(conv_channels=conv_channels)
         self.stats_embed = nn.Linear(3, 16)
 
-        self.plot_attn = PlotAttention(128 + 16)
+        self.plot_attn = PlotAttention(conv_channels[-1] + 16)
 
         self.dim_embed = nn.Linear(1, 1)
 
         self.pre_head_dropout = nn.Dropout(p=0.2)
 
         self.head = nn.Sequential(
-            nn.Linear(128 + 16 + 1, 128),
+            nn.Linear(conv_channels[-1] + 16 + 1, 128),
             nn.ReLU(),
             nn.Linear(128, num_algorithms)
         )
@@ -26,7 +26,7 @@ class ContourCNNSelector(nn.Module):
         self.cat_head = None
         if self.dual_head:
             self.cat_head = nn.Sequential(
-                nn.Linear(128 + 16 + 1, 128),
+                nn.Linear(conv_channels[-1] + 16 + 1, 128),
                 nn.ReLU(),
                 nn.Linear(128, num_algorithms)
             )
@@ -43,20 +43,20 @@ class ContourCNNSelector(nn.Module):
         plots = plots.view(B * K, 1, plots.size(-2), plots.size(-1))
         masks = masks.view(B * K, 1, masks.size(-2), masks.size(-1))
 
-        z = self.encoder(plots, masks)           # (B*K,128)
+        z = self.encoder(plots, masks)           # (B*K, conv_channels[-1])
         z = z.view(B, K, -1)
 
         log_stats = torch.log(stats.clamp_min(1e-6))
         s = self.stats_embed(log_stats)
 
-        z = torch.cat([z, s], dim=-1)             # (B,K,144)
+        z = torch.cat([z, s], dim=-1)             # (B,K, conv_channels[-1]+16)
 
-        Z = self.plot_attn(z)                      # (B,144)
+        Z = self.plot_attn(z)                      # (B, conv_channels[-1]+16)
 
         log_dim = torch.log(dim.unsqueeze(-1).clamp_min(1e-6).to(Z.dtype))  # (B,1)
         d = self.dim_embed(log_dim)                     # (B,1)
 
-        Z = torch.cat([Z, d], dim=-1)  # (B,145)
+        Z = torch.cat([Z, d], dim=-1)  # (B, conv_channels[-1]+16+1)
 
         Z = self.pre_head_dropout(Z)
 
@@ -78,13 +78,13 @@ class PlotAttention(nn.Module):
         return (z * weights.unsqueeze(-1)).sum(dim=1)
 
 class PlotEncoder(nn.Module):
-    def __init__(self):
+    def __init__(self, conv_channels=[32, 64, 128]):
         super().__init__()
-        self.block1 = ConvBlock(1, 32)
-        self.block2 = ConvBlock(32, 64)
-        self.block3 = ConvBlock(64, 128)
+        self.block1 = ConvBlock(1, conv_channels[0])
+        self.block2 = ConvBlock(conv_channels[0], conv_channels[1])
+        self.block3 = ConvBlock(conv_channels[1], conv_channels[2])
 
-        self.spatial_pool = MaskedSpatialAttention(128)
+        self.spatial_pool = MaskedSpatialAttention(conv_channels[2])
 
     def forward(self, x, mask):
         """
@@ -99,7 +99,7 @@ class PlotEncoder(nn.Module):
 
         x = self.block3(x)
 
-        z = self.spatial_pool(x, mask)   # (B, 128)
+        z = self.spatial_pool(x, mask)   # (B, conv_channels[2])
         return z
     
 class MaskedSpatialAttention(nn.Module):

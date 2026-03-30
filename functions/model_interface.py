@@ -813,6 +813,97 @@ def compute_risk_penalty(
     return lam_cap * p_cap + lam_thr * p_thr
 
 
+def _train_predict_from_datasets(
+    *,
+    train_ds: Dataset,
+    test_ds: Dataset,
+    alg_cols: Sequence[str],
+    make_model: Callable[[], nn.Module],
+    device: torch.device,
+    batch_size: int,
+    num_epochs: int,
+    lr: float,
+    weight_decay: float,
+    num_workers: int,
+    loader_seed_base: int,
+    pbar_head: str,
+    tb_log_dir: Optional[str],
+    tb_run_name: Optional[str],
+    tb_log_val: bool,
+    early_stopping_patience: int,
+    cat_loss_weight: float = 15.0,
+    cat_tau: float = 0.5,
+    cat_penalty: float = 15.0,
+    penalty: Optional[np.ndarray] = None,
+) -> pd.DataFrame:
+    train_loader = make_dataloader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        seed=int(loader_seed_base + 11),
+        pin_memory=True,
+        persistent_workers=(num_workers > 0),
+    )
+    test_loader = make_dataloader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=max(1, num_workers // 2),
+        seed=int(loader_seed_base + 22),
+        pin_memory=True,
+        persistent_workers=(num_workers > 0),
+    )
+
+    model = make_model()
+    preds, cat_prob_np, cat_true_np, tb_history = single_train(
+        model,
+        train_loader,
+        test_loader,
+        device=device,
+        num_epochs=num_epochs,
+        lr=lr,
+        weight_decay=weight_decay,
+        pbar_head=pbar_head,
+        tb_log_dir=tb_log_dir,
+        tb_run_name=tb_run_name,
+        tb_log_val=tb_log_val,
+        cat_loss_weight=float(cat_loss_weight),
+        cat_tau=float(cat_tau),
+        cat_penalty=float(cat_penalty),
+        return_cat_arrays=True,
+        return_history=True,
+        early_stopping_patience=int(early_stopping_patience),
+    )
+
+    scores = preds
+    if penalty is not None:
+        scores = scores + np.asarray(penalty, dtype=np.float64)[None, :]
+
+    out = pd.DataFrame(scores, columns=list(alg_cols))
+    out.insert(0, "Repetition", test_ds.repetitions)
+    out.insert(0, "Instance", test_ds.instance_ids)
+    out.insert(0, "Dim", test_ds.dims)
+    out.insert(0, "Problem", test_ds.problem_ids)
+    out.attrs["tb_history"] = tb_history
+
+    try:
+        out.attrs["cat_accuracy"] = _cat_accuracy_table(
+            problem_ids=test_ds.problem_ids,
+            dims=test_ds.dims,
+            cat_prob=cat_prob_np,
+            cat_true=cat_true_np,
+            cat_tau=float(cat_tau),
+        ).round(6).to_dict(orient="split")
+        out.attrs["cat_tau"] = float(cat_tau)
+    except Exception:
+        pass
+
+    del model
+    torch.cuda.empty_cache()
+    return out
+
+
 def _train_predict_one_split(
     *,
     df_train: pd.DataFrame,
@@ -869,84 +960,37 @@ def _train_predict_one_split(
         target_scale=str(target_scale),
     )
 
-    base_loader_seed = int(torch.initial_seed()) & 0xFFFFFFFF
-    train_loader = make_dataloader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        seed=int(base_loader_seed + 11),
-        pin_memory=True,
-        persistent_workers=(num_workers > 0),
-    )
-    test_loader = make_dataloader(
-        test_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=max(1, num_workers // 2),
-        seed=int(base_loader_seed + 22),
-        pin_memory=True,
-        persistent_workers=(num_workers > 0),
-    )
-
     penalty: Optional[np.ndarray] = None
     if use_tail_penalty:
         df_tail_train = tail_table(df_train)
-        penalty = compute_risk_penalty(df_tail_train, lam_cap=float(tail_lam_cap), lam_thr=float(tail_lam_thr))
-    # print("algorithm columns:", alg_cols)
-    # print("algortihm order 1:", df_train.columns[2:])
-    # print("algorithm order 2:", df_tail_train.index.tolist())
+        penalty = float(tail_scale) * compute_risk_penalty(
+            df_tail_train,
+            lam_cap=float(tail_lam_cap),
+            lam_thr=float(tail_lam_thr),
+        )
 
-    model = make_model()
-    preds, cat_prob_np, cat_true_np, tb_history = single_train(
-        model,
-        train_loader,
-        test_loader,
+    return _train_predict_from_datasets(
+        train_ds=train_ds,
+        test_ds=test_ds,
+        alg_cols=alg_cols,
+        make_model=make_model,
         device=device,
+        batch_size=batch_size,
         num_epochs=num_epochs,
         lr=lr,
         weight_decay=weight_decay,
+        num_workers=num_workers,
+        loader_seed_base=int(torch.initial_seed()) & 0xFFFFFFFF,
         pbar_head=pbar_head,
         tb_log_dir=tb_log_dir,
         tb_run_name=tb_run_name,
         tb_log_val=tb_log_val,
+        early_stopping_patience=int(early_stopping_patience),
         cat_loss_weight=float(cat_loss_weight),
         cat_tau=float(cat_tau),
         cat_penalty=float(cat_penalty),
-        return_cat_arrays=True,
-        return_history=True,
-        early_stopping_patience=int(early_stopping_patience)
+        penalty=penalty,
     )
-
-    scores = preds
-    if penalty is not None:
-        scores = scores + float(tail_scale) * penalty[None, :]
-
-    out = pd.DataFrame(scores, columns=alg_cols)
-    out.insert(0, "Repetition", test_ds.repetitions)
-    out.insert(0, "Instance", test_ds.instance_ids)
-    out.insert(0, "Dim", test_ds.dims)
-    out.insert(0, "Problem", test_ds.problem_ids)
-    out.attrs["tb_history"] = tb_history
-
-    # Catastrophe recognition accuracy table for this fold
-    try:
-        out.attrs["cat_accuracy"] = _cat_accuracy_table(
-            problem_ids=test_ds.problem_ids,
-            dims=test_ds.dims,
-            cat_prob=cat_prob_np,
-            cat_true=cat_true_np,
-            cat_tau=cat_tau,
-        ).round(6).to_dict(orient="split")
-        out.attrs["cat_tau"] = float(cat_tau)
-    except Exception:
-        # Keep training results usable even if metrics fail for any reason.
-        pass
-
-    del model
-    torch.cuda.empty_cache()
-
-    return out
 
 def run_random_split(
     df: pd.DataFrame,
@@ -1065,68 +1109,28 @@ def run_random_split(
         train_ds = SubsetMultiViewNPZDataset(base_ds, train_idx, cache=cache_train)
         test_ds = SubsetMultiViewNPZDataset(base_ds, test_idx, cache=cache_test)
 
-        fold_loader_seed = int(seed) + int(fold_idx) * 1000
-        train_loader = make_dataloader(
-            train_ds,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            seed=int(fold_loader_seed + 11),
-            pin_memory=True,
-            persistent_workers=(num_workers > 0),
-        )
-        test_loader = make_dataloader(
-            test_ds,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=max(1, num_workers // 2),
-            seed=int(fold_loader_seed + 22),
-            pin_memory=True,
-            persistent_workers=(num_workers > 0),
-        )
-
-        model = make_model()
-        cat_tau = 0.5
-        preds, cat_prob_np, cat_true_np, tb_history = single_train(
-            model,
-            train_loader,
-            test_loader,
+        out = _train_predict_from_datasets(
+            train_ds=train_ds,
+            test_ds=test_ds,
+            alg_cols=list(df.columns[2:]),
+            make_model=make_model,
             device=device,
+            batch_size=batch_size,
             num_epochs=num_epochs,
             lr=lr,
             weight_decay=weight_decay,
+            num_workers=num_workers,
+            loader_seed_base=int(seed) + int(fold_idx) * 1000,
             pbar_head=f"[train kfold(inst) {fold_idx+1}/{n_splits}]" if k_folds >= 2 else "[train holdout(inst)]",
             tb_log_dir=tb_log_dir,
             tb_run_name=f"random/fold_{fold_idx}",
             tb_log_val=tb_log_val,
-            cat_tau=cat_tau,
-            return_cat_arrays=True,
-            return_history=True,
-            early_stopping_patience=int(early_stopping_patience)
+            early_stopping_patience=int(early_stopping_patience),
+            cat_loss_weight=15.0,
+            cat_tau=0.5,
+            cat_penalty=15.0,
+            penalty=None,
         )
-
-        alg_cols = list(df.columns[2:])
-        out = pd.DataFrame(preds, columns=alg_cols)
-        out.insert(0, "Repetition", test_ds.repetitions)
-        out.insert(0, "Instance", test_ds.instance_ids)
-        out.insert(0, "Dim", test_ds.dims)
-        out.insert(0, "Problem", test_ds.problem_ids)
-        out.attrs["tb_history"] = tb_history
-
-        try:
-            out.attrs["cat_accuracy"] = _cat_accuracy_table(
-                problem_ids=test_ds.problem_ids,
-                dims=test_ds.dims,
-                cat_prob=cat_prob_np,
-                cat_true=cat_true_np,
-                cat_tau=cat_tau,
-            ).round(6).to_dict(orient="split")
-            out.attrs["cat_tau"] = float(cat_tau)
-        except Exception:
-            pass
-
-        del model
-        torch.cuda.empty_cache()
 
         out.attrs["cv_protocol"] = "kfold_instance_cv" if k_folds >= 2 else "holdout_instance_cv"
         out.attrs["split_unit"] = "problem_dim_instance"
@@ -1266,7 +1270,6 @@ def run_leave_instance_out(
     data_dir = default_data_dir(data_root, resolution)
 
     preds_by_fold: Dict[str, pd.DataFrame] = {}
-    alg_cols = list(df.columns[2:])
 
     instances_all = [int(i) for i in instances_all]
     if len(instances_all) == 0:
@@ -1296,71 +1299,32 @@ def run_leave_instance_out(
             k_views=k_views,
         )
 
-        fold_loader_seed = int(seed) + int(fold) * 1000
-        train_loader = make_dataloader(
-            train_ds,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            seed=int(fold_loader_seed + 11),
-            pin_memory=True,
-            persistent_workers=(num_workers > 0),
-        )
-        test_loader = make_dataloader(
-            test_ds,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=max(1, num_workers // 2),
-            seed=int(fold_loader_seed + 22),
-            pin_memory=True,
-            persistent_workers=(num_workers > 0),
-        )
-
-        model = make_model()
-        cat_tau = 0.5
-        preds, cat_prob_np, cat_true_np, tb_history = single_train(
-            model,
-            train_loader,
-            test_loader,
+        out = _train_predict_from_datasets(
+            train_ds=train_ds,
+            test_ds=test_ds,
+            alg_cols=list(df.columns[2:]),
+            make_model=make_model,
             device=device,
+            batch_size=batch_size,
             num_epochs=num_epochs,
             lr=lr,
             weight_decay=weight_decay,
+            num_workers=num_workers,
+            loader_seed_base=int(seed) + int(fold) * 1000,
             pbar_head=f"[train LIO {fold+1}/{len(instances_all)}]",
             tb_log_dir=tb_log_dir,
             tb_run_name=f"lio/inst_{test_inst}",
             tb_log_val=tb_log_val,
-            cat_tau=cat_tau,
-            return_cat_arrays=True,
-            return_history=True,
-            early_stopping_patience=int(early_stopping_patience)
+            early_stopping_patience=int(early_stopping_patience),
+            cat_loss_weight=15.0,
+            cat_tau=0.5,
+            cat_penalty=15.0,
+            penalty=None,
         )
-
-        out = pd.DataFrame(preds, columns=alg_cols)
-        out.insert(0, "Repetition", test_ds.repetitions)
-        out.insert(0, "Instance", test_ds.instance_ids)
-        out.insert(0, "Dim", test_ds.dims)
-        out.insert(0, "Problem", test_ds.problem_ids)
-        out.attrs["tb_history"] = tb_history
-
-        try:
-            out.attrs["cat_accuracy"] = _cat_accuracy_table(
-                problem_ids=test_ds.problem_ids,
-                dims=test_ds.dims,
-                cat_prob=cat_prob_np,
-                cat_true=cat_true_np,
-                cat_tau=cat_tau,
-            ).round(6).to_dict(orient="split")
-            out.attrs["cat_tau"] = float(cat_tau)
-        except Exception:
-            pass
         out.attrs["cv_protocol"] = "leave_instance_out"
         out.attrs["train_instances"] = train_insts
         out.attrs["test_instances"] = [test_inst]
         preds_by_fold[f"fold_{fold}"] = out
-
-        del model
-        torch.cuda.empty_cache()
 
     return preds_by_fold
 

@@ -260,6 +260,19 @@ def _make_tasks(
     raise ValueError(f"Unknown protocol: {protocol}")
 
 
+def _result_file_suffix(args: argparse.Namespace) -> str:
+    return (
+        f"tailpenalty_{int(args.tail_penalty)}"
+        f"_taillamcap_{args.tail_lam_cap}"
+        f"_taillamthr_{args.tail_lam_thr}"
+        f"_catlossweight_{args.cat_loss_weight}"
+        f"_cattau_{args.cat_tau}"
+        f"_catpenalty_{args.cat_penalty}"
+        f"_res_{args.resolution}"
+        f"_k_views_{args.k_views}"
+    )
+
+
 def _run_orchestrator(args: argparse.Namespace) -> None:
 
     out_dir = Path(args.out_dir).expanduser().resolve()
@@ -410,32 +423,16 @@ def _run_orchestrator(args: argparse.Namespace) -> None:
         if not preds_by_fold:
             continue
 
-        if args.tail_penalty:
-            if args.dual_head:
-                mid_dir = "tail_dual_head"
-            else:
-                mid_dir = "tail_single_head"
-        else:
-            if args.dual_head:
-                mid_dir = "no_tail_dual_head"
-            else:
-                mid_dir = "no_tail_single_head"
-
         metrics = output_results(df, preds_by_fold, protocol=p)
-        # results_dir = out_dir / protocol_dir.get(p, p) / mid_dir
         results_dir = out_dir / protocol_dir.get(p, p)
-        # out_csv = results_dir / f"res_{args.resolution}_k_views_{args.k_views}.csv"
-
-        # Name it based on TAIL_PENALTY, TAIL_LAMS_CAP, TAIL_LAMS_THR, DUAL_HEAD, CAT_LOSS_WEIGHT, CAT_TAU, CAT_PENALTY, EARLY_STOPPING_PATIENCE
-        out_csv = results_dir / f"res_tailpenalty_{int(args.tail_penalty)}_taillamcap_{args.tail_lam_cap}_taillamthr_{args.tail_lam_thr}_catlossweight_{args.cat_loss_weight}_cattau_{args.cat_tau}_catpenalty_{args.cat_penalty}_res_{args.resolution}_k_views_{args.k_views}.csv"
+        suffix = _result_file_suffix(args)
+        out_csv = results_dir / f"res_{suffix}.csv"
         _write_metrics_csv(metrics, out_csv)
         print(f"Wrote {p} results CSV: {out_csv}")
 
         # Per-sample predictions table (concatenation of all held-out samples)
         df_preds_all = pd.concat(list(preds_by_fold.values()), ignore_index=True)
-        # preds_out = results_dir / f"preds_res_{args.resolution}_k_views_{args.k_views}.csv.gz"
-
-        preds_out = results_dir / f"preds_tailpenalty_{int(args.tail_penalty)}_taillamcap_{args.tail_lam_cap}_taillamthr_{args.tail_lam_thr}_catlossweight_{args.cat_loss_weight}_cattau_{args.cat_tau}_catpenalty_{args.cat_penalty}_res_{args.resolution}_k_views_{args.k_views}.csv.gz"
+        preds_out = results_dir / f"preds_{suffix}.csv.gz"
 
         df_preds_all.to_csv(preds_out, index=False, compression="gzip")
         print(f"Wrote {p} per-sample predictions: {preds_out}")
@@ -525,6 +522,37 @@ def _run_one_task(
     tb_log_dir_use = str(tb_log_dir).strip() if tb_log_dir is not None else ""
     tb_log_dir_use = tb_log_dir_use if tb_log_dir_use else None
     tb_run_name = f"{task.protocol}/{task.task_id}"
+    effective_cat_loss_weight = (float(cat_loss_weight) if bool(dual_head) else 0.0)
+    effective_cat_tau = float(cat_tau)
+    effective_cat_penalty = (float(cat_penalty) if bool(dual_head) else 0.0)
+
+    shared_split_kwargs = dict(
+        data_dir=data_dir,
+        num_repetitions=num_repetitions,
+        k_views=k_views,
+        make_model=make_model,
+        device=device,
+        batch_size=batch_size,
+        num_epochs=num_epochs,
+        lr=lr,
+        weight_decay=weight_decay,
+        num_workers=num_workers,
+        cache_train=cache_train,
+        cache_test=cache_test,
+        strict=strict,
+        target_scale=str(target_scale),
+        cat_loss_weight=effective_cat_loss_weight,
+        cat_tau=effective_cat_tau,
+        cat_penalty=effective_cat_penalty,
+        use_tail_penalty=bool(tail_penalty),
+        tail_lam_cap=float(tail_lam_cap),
+        tail_lam_thr=float(tail_lam_thr),
+        tail_scale=float(tail_scale),
+        early_stopping_patience=int(early_stopping_patience),
+        tb_log_dir=tb_log_dir_use,
+        tb_run_name=tb_run_name,
+        tb_log_val=bool(tb_log_val),
+    )
 
     if task.protocol == "lio":
         test_inst = int(payload["test_inst"])
@@ -532,34 +560,10 @@ def _run_one_task(
         out = _train_predict_one_split(
             df_train=df,
             df_test=df,
-            data_dir=data_dir,
             train_instances=train_insts,
             test_instances=[test_inst],
-            num_repetitions=num_repetitions,
-            k_views=k_views,
-            make_model=make_model,
-            device=device,
-            batch_size=batch_size,
-            num_epochs=num_epochs,
-            lr=lr,
-            weight_decay=weight_decay,
-            num_workers=num_workers,
-            cache_train=cache_train,
-            cache_test=cache_test,
-            strict=strict,
-            target_scale=str(target_scale),
-            cat_loss_weight=(float(cat_loss_weight) if bool(dual_head) else 0.0),
-            cat_tau=float(cat_tau),
-            cat_penalty=(float(cat_penalty) if bool(dual_head) else 0.0),
-            use_tail_penalty=bool(tail_penalty),
-            tail_lam_cap=float(tail_lam_cap),
-            tail_lam_thr=float(tail_lam_thr),
-            tail_scale=float(tail_scale),
-            early_stopping_patience=int(early_stopping_patience),
             pbar_head=f"[train LIO i{test_inst}]",
-            tb_log_dir=tb_log_dir_use,
-            tb_run_name=tb_run_name,
-            tb_log_val=bool(tb_log_val),
+            **shared_split_kwargs,
         )
         out.attrs["cv_protocol"] = "leave_instance_out"
         out.attrs["train_instances"] = train_insts
@@ -580,34 +584,10 @@ def _run_one_task(
         out = _train_predict_one_split(
             df_train=train_df,
             df_test=test_df,
-            data_dir=data_dir,
             train_instances=instances_all,
             test_instances=instances_all,
-            num_repetitions=num_repetitions,
-            k_views=k_views,
-            make_model=make_model,
-            device=device,
-            batch_size=batch_size,
-            num_epochs=num_epochs,
-            lr=lr,
-            weight_decay=weight_decay,
-            num_workers=num_workers,
-            cache_train=cache_train,
-            cache_test=cache_test,
-            strict=strict,
-            target_scale=str(target_scale),
-            cat_loss_weight=(float(cat_loss_weight) if bool(dual_head) else 0.0),
-            cat_tau=float(cat_tau),
-            cat_penalty=(float(cat_penalty) if bool(dual_head) else 0.0),
-            use_tail_penalty=bool(tail_penalty),
-            tail_lam_cap=float(tail_lam_cap),
-            tail_lam_thr=float(tail_lam_thr),
-            tail_scale=float(tail_scale),
-            early_stopping_patience=int(early_stopping_patience),
             pbar_head=f"[train LPO {fold_idx+1}/24]",
-            tb_log_dir=tb_log_dir_use,
-            tb_run_name=tb_run_name,
-            tb_log_val=bool(tb_log_val),
+            **shared_split_kwargs,
         )
         out.attrs["cv_protocol"] = "leave_problem_out"
         out.attrs["test_problems"] = [test_prob]
@@ -705,9 +685,9 @@ def _run_one_task(
             tb_log_dir=tb_log_dir_use,
             tb_run_name=tb_run_name,
             tb_log_val=bool(tb_log_val),
-            cat_loss_weight=(float(cat_loss_weight) if bool(dual_head) else 0.0),
-            cat_tau=float(cat_tau),
-            cat_penalty=(float(cat_penalty) if bool(dual_head) else 0.0),
+            cat_loss_weight=effective_cat_loss_weight,
+            cat_tau=effective_cat_tau,
+            cat_penalty=effective_cat_penalty,
             early_stopping_patience=int(early_stopping_patience),
             return_cat_arrays=False,
             return_history=True,
