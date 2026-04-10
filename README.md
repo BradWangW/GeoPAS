@@ -2,17 +2,32 @@
 
 This workspace contains the GeoPAS training and analysis pipeline for algorithm selection on BBOB using multi-view two-dimensional slices of black-box functions.
 
-## Structure
+## **Repository Layout**
 
-- `train_parallel.py`: main training entrypoint; schedules cross-validation tasks across GPUs and writes per-protocol summary and prediction files.
-- `train.sh`: local sweep wrapper around `train_parallel.py`; defines the parameter grid and output layout used in the current experiments.
-- `functions/model.py`: convolutional selector model.
-- `functions/model_interface.py`: dataset loading, training, evaluation, and result-table generation.
-- `data_generation/plots/plot_generation_soo_extensive.py`: generates `.npz` multi-view training data from BBOB problems.
-- `data_generation/performances/ERT_cal.ipynb`: computes reference performance tables used to build relERT labels.
-- `analysis.ipynb`: validates result tables and performs protocol-level and cell-level failure analysis.
-- `concatenate_over_parameters.ipynb`: aggregates many `res_*.csv` outputs into sectioned comparison files.
-- `robustness_over_budget.ipynb`: compiles aggregated result tables into `res`, `k_views`, and budget summaries and heatmaps.
+```text
+GeoPAS_v1/
+│
+├── functions/
+│   ├── model.py                          # GeoPAS model architecture
+│   └── model_interface.py                # Dataset loading, training, evaluation, and metrics helpers
+│
+├── data_generation/
+│   ├── performances/
+│   │   ├── ERT_cal.ipynb                 # Builds the reference performance table used for relERT labels
+│   │   └── relert.csv                    # Canonical relERT table consumed by training and analysis
+│   │
+│   └── plots/
+│       ├── auxiliary_functions.py        # Helper routines for BBOB slice and contour generation
+│       ├── plot_generation_soo_extensive.py  # Generates multi-view .npz training data
+│       ├── plot_check.ipynb              # Visual sanity checks for generated plot data
+│       └── AS_BBOB_SOO.code-workspace    # Auxiliary VS Code workspace for data-generation work
+│
+├── train_parallel.py                     # Main training / evaluation entry point
+├── train.sh                              # Shell sweep wrapper for the current experiment grid
+├── analysis.ipynb                        # Validation and failure-mode analysis for completed runs
+├── concatenate_over_parameters.ipynb     # Aggregates per-run result CSVs across parameter settings
+├── robustness_over_budget.ipynb          # Summarizes aggregated results over resolution, k_views, and budget
+```
 
 ## Step-by-Step Guide
 
