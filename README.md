@@ -1,72 +1,80 @@
 # GeoPAS
 
-This workspace contains the GeoPAS training and analysis pipeline for algorithm selection on BBOB using multi-view two-dimensional slices of black-box functions.
+GeoPAS contains the training and analysis pipeline for algorithm selection on BBOB using multi-view two-dimensional slices of black-box functions.
 
-## **Repository Layout**
+## Repository layout
 
 ```text
-GeoPAS_v1/
-│
+GeoPAS/
 ├── functions/
-│   ├── model.py                          # GeoPAS model architecture
-│   └── model_interface.py                # Dataset loading, training, evaluation, and metrics helpers
-│
+│   ├── model.py
+│   └── model_interface.py
 ├── data_generation/
 │   ├── performances/
-│   │   ├── ERT_cal.ipynb                 # Builds the reference performance table used for relERT labels
-│   │   └── relert.csv                    # Canonical relERT table consumed by training and analysis
-│   │
+│   │   ├── ERT_cal.ipynb
+│   │   └── relert.csv
 │   └── plots/
-│       ├── auxiliary_functions.py        # Helper routines for BBOB slice and contour generation
-│       ├── plot_generation_soo_extensive.py  # Generates multi-view .npz training data
-│       ├── plot_check.ipynb              # Visual sanity checks for generated plot data
-│       └── AS_BBOB_SOO.code-workspace    # Auxiliary VS Code workspace for data-generation work
-│
-├── train_parallel.py                     # Main training / evaluation entry point
-├── train.sh                              # Shell sweep wrapper for the current experiment grid
-├── analysis.ipynb                        # Validation and failure-mode analysis for completed runs
-├── concatenate_over_parameters.ipynb     # Aggregates per-run result CSVs across parameter settings
-├── robustness_over_budget.ipynb          # Summarizes aggregated results over resolution, k_views, and budget
+│       ├── auxiliary_functions.py
+│       ├── plot_generation_soo_extensive.py
+│       ├── plot_check.ipynb
+│       └── AS_BBOB_SOO.code-workspace
+├── train_parallel.py
+├── train.sh
+├── analysis.ipynb
+├── concatenate_over_parameters.ipynb
+└── robustness_over_budget.ipynb
 ```
+<!-- 
+## Main files
 
-## Step-by-Step Guide
+- `functions/model.py`: GeoPAS model definition
+- `functions/model_interface.py`: dataset loading, training, evaluation, and metrics
+- `data_generation/performances/ERT_cal.ipynb`: builds the relERT table
+- `data_generation/performances/relert.csv`: relERT labels used by training and analysis
+- `data_generation/plots/plot_generation_soo_extensive.py`: generates multi-view `.npz` data
+- `train.sh`: sweep wrapper for the current experiment grid
+- `train_parallel.py`: training and evaluation entry point
+- `concatenate_over_parameters.ipynb`: aggregates result CSVs across runs
+- `robustness_over_budget.ipynb`: summarizes results over resolution, number of views, and budget
+- `analysis.ipynb`: validation and failure-mode analysis -->
 
-The commands below assume you are running from this workspace root.
-
-1. Create the environment and activate it.
+## Setup
 
 ```bash
-export PROJECT_ROOT=/path/to/AS_BBO_REBUILT
 conda env create -f environment.yaml
 conda activate as_bbo
 ```
 
-2. Build the reference relERT table.
+## Pipeline
 
-```bash
-code data_generation/performances/ERT_cal.ipynb
-```
+### 1. Build the relERT table
 
-Run all cells in the notebook. The target artifact is `data_generation/performances/relert.csv`.
+`data_generation/performances/ERT_cal.ipynb` produces the table, which is also given as `data_generation/performances/relert.csv`.
 
-3. Generate the multi-view `.npz` data.
+### 2. Generate multi-slice `.npz` data
 
 ```bash
 PROJECT_ROOT="$PROJECT_ROOT" \
 python data_generation/plots/plot_generation_soo_extensive.py
 ```
 
-As currently written, this script generates data under `$PROJECT_ROOT/data/bbob_by_deepela/maxscale_0.7_logscale_false/`.
+will write data under:
 
-4. Train and evaluate GeoPAS.
+```text
+$PROJECT_ROOT/data/bbob_by_deepela/maxscale_0.7_logscale_false/
+```
 
-If you want to run the current configured sweep exactly as `train.sh` defines it:
+depending on the setting.
+
+### 3. Train and evaluate
+
+To run the current sweep:
 
 ```bash
 bash train.sh
 ```
 
-If you want to train on the data generated in step 3, point `DATA_ROOT` at that output explicitly:
+To point training explicitly to the generated data:
 
 ```bash
 PROJECT_ROOT="$PROJECT_ROOT" \
@@ -74,44 +82,26 @@ DATA_ROOT="$PROJECT_ROOT/data/bbob_by_deepela/maxscale_0.7_logscale_false" \
 bash train.sh
 ```
 
-This writes per-run outputs under `$PROJECT_ROOT/results/bbob_by_deepela/results/bbob/...`, including `res_*.csv` and `preds_*.csv.gz`.
+Outputs are written under:
 
-5. Aggregate result tables across parameter settings.
-
-```bash
-code concatenate_over_parameters.ipynb
+```text
+$PROJECT_ROOT/results/bbob_by_deepela/results/bbob/
 ```
 
-Run the first code cell to create `AS_mean_median_p90__{LPO,LIO,RANDOM}__ALL_RUNS.csv`, then run the second code cell to create `AS_mean_median_p90__MERGED__ALL_RUNS.csv`.
+including a summary table and a dataframe of model outputs. 
 
-6. Inspect robustness over budget.
+### 4. Aggregate results
 
-```bash
-code robustness_over_budget.ipynb
-```
+If results over multiple parameter settings are obtained, use `concatenate_over_parameters.ipynb` to aggregate them into protocol-wise tables`AS_mean_median_p90__{LPO,LIO,RANDOM}__ALL_RUNS.csv`, and then to `AS_mean_median_p90__MERGED__ALL_RUNS.csv`. 
 
-Run the notebook cells after setting `protocol` to the split you want to inspect.
+### 5. Analyses
 
-7. Validate outputs and inspect failure modes.
+- `robustness_over_budget.ipynb` summarises results over resolution and number of views. 
+- `analysis.ipynb`: validation and failure-mode analysis
 
-```bash
-code analysis.ipynb
-```
+## Path overrides
 
-Run all cells. Outputs are written under `analysis_outputs/failure_analysis/...` inside this workspace.
-
-## Data Expectations
-
-- The canonical relERT table used by this workspace is `data_generation/performances/relert.csv`.
-- Training expects a relERT CSV indexed by `Problem` and `Dim`.
-- Training data are stored under a root of the form `.../res_<resolution>/` and loaded from `.npz` files named like `f{fid}_i{instance}_dim{dim}_rep{rep}.npz`.
-- By default, the shell script, notebooks, and data-generation script resolve the external `data/` and `results/` trees relative to the parent directory of this workspace, matching the current layout without changing the underlying pipeline.
-
-If the `code` shell command is not available on your machine, open the same notebooks directly from the current VS Code workspace and run the cells there.
-
-## Common Overrides
-
-The main training path overrides are environment variables or shell variables:
+The main path overrides used by `train.sh` are:
 
 ```bash
 PROJECT_ROOT=/path/to/AS_BBO_REBUILT \
@@ -122,19 +112,16 @@ TB_LOG_DIR=/path/to/results/tensorboard \
 bash train.sh
 ```
 
-The notebooks use the same default root resolution and honor `PROJECT_ROOT` and `RESULTS_ROOT` when you want to point them elsewhere.
+The notebooks use the same default root resolution and also honor `PROJECT_ROOT` and `RESULTS_ROOT`.
 
-If you want to bypass `train.sh`, run the orchestrator directly with explicit paths:
+## Direct training entry point
+
+To bypass `train.sh`:
 
 ```bash
 python train_parallel.py \
-	--protocol all \
-	--csv data_generation/performances/relert.csv \
-	--data-root /path/to/data_root \
-	--out-dir /path/to/results
+  --protocol all \
+  --csv data_generation/performances/relert.csv \
+  --data-root /path/to/data_root \
+  --out-dir /path/to/results
 ```
-
-## Notes
-
-- `train.sh` preserves the current experiment behavior, but its default paths are now computed from the workspace location instead of fixed machine-specific literals.
-- The notebooks are analysis and aggregation utilities layered on top of the CSV outputs written by the training pipeline.
