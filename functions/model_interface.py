@@ -113,7 +113,7 @@ class MultiViewNPZDataset(Dataset):
         strict: bool = True,
         k_views: int = 32,
         target_scale: str = "log",
-        catastrophe_log_threshold: float = 10.0,
+        catastrophe_log_threshold: float = np.log(36690),
     ):
         # Keep a private copy to avoid mutating caller data.
         # (Important: evaluation expects relERT >= 1; training may use log-targets.)
@@ -470,6 +470,7 @@ def single_train(
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optim, gamma=lr_decay_gamma)
 
     reg_loss_fn = nn.SmoothL1Loss()
+    # reg_loss_fn = nn.SmoothL1Loss(beta=12.477)
     cat_loss_fn = nn.BCEWithLogitsLoss()
 
     base_loader_seed = int(torch.initial_seed()) & 0xFFFFFFFF
@@ -830,6 +831,7 @@ def _train_predict_from_datasets(
     tb_log_dir: Optional[str],
     tb_run_name: Optional[str],
     tb_log_val: bool,
+    val_ratio: float,
     early_stopping_patience: int,
     cat_loss_weight: float = 15.0,
     cat_tau: float = 0.5,
@@ -868,6 +870,7 @@ def _train_predict_from_datasets(
         tb_log_dir=tb_log_dir,
         tb_run_name=tb_run_name,
         tb_log_val=tb_log_val,
+        val_ratio=float(val_ratio),
         cat_loss_weight=float(cat_loss_weight),
         cat_tau=float(cat_tau),
         cat_penalty=float(cat_penalty),
@@ -935,6 +938,7 @@ def _train_predict_one_split(
     tb_log_dir: Optional[str] = None,
     tb_run_name: Optional[str] = None,
     tb_log_val: bool = False,
+    val_ratio: float = 0.0,
     early_stopping_patience: int = 15,
 ) -> pd.DataFrame:
     alg_cols = list(df_train.columns[2:])
@@ -985,6 +989,7 @@ def _train_predict_one_split(
         tb_log_dir=tb_log_dir,
         tb_run_name=tb_run_name,
         tb_log_val=tb_log_val,
+        val_ratio=float(val_ratio),
         early_stopping_patience=int(early_stopping_patience),
         cat_loss_weight=float(cat_loss_weight),
         cat_tau=float(cat_tau),
@@ -1014,6 +1019,7 @@ def run_random_split(
     seed: int = 42,
     tb_log_dir: Optional[str] = None,
     tb_log_val: bool = False,
+    val_ratio: float = 0.1,
     early_stopping_patience: int = 15,
 ) -> Dict[str, pd.DataFrame]:
     """Random CV over (problem×dim×instance) groups (repetitions kept together).
@@ -1125,6 +1131,7 @@ def run_random_split(
             tb_log_dir=tb_log_dir,
             tb_run_name=f"random/fold_{fold_idx}",
             tb_log_val=tb_log_val,
+            val_ratio=float(val_ratio),
             early_stopping_patience=int(early_stopping_patience),
             cat_loss_weight=15.0,
             cat_tau=0.5,
@@ -1169,6 +1176,7 @@ def run_leave_problem_out(
     seed: int = 42,
     tb_log_dir: Optional[str] = None,
     tb_log_val: bool = False,
+    val_ratio: float = 0.0,
     early_stopping_patience: int = 15,
 ) -> Dict[str, pd.DataFrame]:
     """Leave-problem-out (LPO): one held-out BBOB function id per fold."""
@@ -1229,6 +1237,7 @@ def run_leave_problem_out(
             tb_log_dir=tb_log_dir,
             tb_run_name=f"lpo/{test_prob}",
             tb_log_val=tb_log_val,
+            val_ratio=float(val_ratio),
             early_stopping_patience=int(early_stopping_patience)
         )
         out.attrs["cv_protocol"] = "leave_problem_out"
@@ -1262,6 +1271,7 @@ def run_leave_instance_out(
     seed: int = 42,
     tb_log_dir: Optional[str] = None,
     tb_log_val: bool = False,
+    val_ratio: float = 0.1,
     early_stopping_patience: int = 15,
 ) -> Dict[str, pd.DataFrame]:
     """Leave-instance-out (LIO) protocol: one held-out instance per fold."""
@@ -1315,6 +1325,7 @@ def run_leave_instance_out(
             tb_log_dir=tb_log_dir,
             tb_run_name=f"lio/inst_{test_inst}",
             tb_log_val=tb_log_val,
+            val_ratio=float(val_ratio),
             early_stopping_patience=int(early_stopping_patience),
             cat_loss_weight=15.0,
             cat_tau=0.5,
@@ -1363,6 +1374,9 @@ def output_results(
     - scores: mean true relERT achieved by the picked algorithm
     - median_scores: median true relERT achieved by the picked algorithm (computed on concatenation of all folds)
     - p90_scores: 90th percentile true relERT achieved by the picked algorithm (computed on concatenation of all folds)
+    - log_scores: mean log(relERT) achieved by the picked algorithm
+    - log_median_scores: median log(relERT) achieved by the picked algorithm (computed on concatenation of all folds)
+    - log_p90_scores: 90th percentile log(relERT) achieved by the picked algorithm (computed on concatenation of all folds)
     - accuracies: exact-match accuracy vs the true best algorithm
     - f1: macro-F1 over algorithms
     - pick_rate: algorithm pick frequency (from the first fold)
@@ -1376,6 +1390,9 @@ def output_results(
     - p90_sbs: SBS baseline using 90th percentile aggregation (computed on concatenation of all folds)
     - p90_vbs: VBS baseline using 90th percentile aggregation (computed on concatenation of all folds)
     - p90_gap_closure: gap closure using p90 AS/SBS/VBS (computed on concatenation of all folds)
+    - log_sbs/log_vbs/log_gap_closure: mean log(relERT) SBS/VBS/gap-closure tables
+    - log_median_sbs/log_median_vbs/log_median_gap_closure: median log(relERT) SBS/VBS/gap-closure tables
+    - log_p90_sbs/log_p90_vbs/log_p90_gap_closure: p90 log(relERT) SBS/VBS/gap-closure tables
     """
     alg_cols = list(df.columns[2:])
 
@@ -1405,13 +1422,23 @@ def output_results(
     perf_by_key = df_gt.set_index(["Problem", "Dim"])[alg_cols]
     true_best_alg = perf_by_key.idxmin(axis=1).rename("true_alg")
 
+    def _metric_space(values: np.ndarray, *, use_log: bool) -> np.ndarray:
+        values = np.asarray(values, dtype=float)
+        if not use_log:
+            return values
+        return np.log(np.maximum(values, 1e-6))
+
     # SBS definition (global): choose ONE algorithm over the entire dataset `df`.
     # Then report its performance on each subgroup/dimension subset.
     perf_all = perf_by_key.to_numpy(dtype=float)
+    perf_all_log = _metric_space(perf_all, use_log=True)
     sbs_alg_idx_global = int(np.argmin(np.mean(perf_all, axis=0)))
+    log_sbs_alg_idx_global = int(np.argmin(np.mean(perf_all_log, axis=0)))
     # SBS algorithm should be defined concistently
     sbs_alg_idx_med_global = sbs_alg_idx_global
     sbs_alg_idx_p90_global = sbs_alg_idx_global
+    log_sbs_alg_idx_med_global = log_sbs_alg_idx_global
+    log_sbs_alg_idx_p90_global = log_sbs_alg_idx_global
     # sbs_alg_idx_med_global = int(np.argmin(np.median(perf_all, axis=0)))
     # # p90-SBS (global): choose algorithm minimizing the 90th percentile relERT.
     # sbs_alg_idx_p90_global = int(np.argmin(np.quantile(perf_all, 0.9, axis=0)))
@@ -1440,6 +1467,10 @@ def output_results(
     dict_df_sbs: Dict[str, pd.DataFrame] = {}
     dict_df_vbs: Dict[str, pd.DataFrame] = {}
     dict_df_gap: Dict[str, pd.DataFrame] = {}
+    dict_df_log_scores: Dict[str, pd.DataFrame] = {}
+    dict_df_log_sbs: Dict[str, pd.DataFrame] = {}
+    dict_df_log_vbs: Dict[str, pd.DataFrame] = {}
+    dict_df_log_gap: Dict[str, pd.DataFrame] = {}
 
     # Extract catastrophe-accuracy payloads (if present) before we sanitize attrs.
     dict_df_cat_acc: Dict[str, pd.DataFrame] = {}
@@ -1462,10 +1493,13 @@ def output_results(
 
         # True relERT row for each sample, then pick the column of the predicted algorithm.
         perf_rows = perf_by_key.loc[keys].to_numpy(dtype=float)
+        perf_rows_log = _metric_space(perf_rows, use_log=True)
         pred_idx = pd.Series(pred_alg).map(col_to_idx).to_numpy(dtype=int)
         picked_score = perf_rows[np.arange(len(perf_rows)), pred_idx]
+        picked_score_log = perf_rows_log[np.arange(len(perf_rows_log)), pred_idx]
 
         sbs_alg_idx = sbs_alg_idx_global
+        log_sbs_alg_idx = log_sbs_alg_idx_global
 
         true_alg = true_best_alg.loc[keys].to_numpy()
         correct = (pred_alg == true_alg)
@@ -1485,6 +1519,10 @@ def output_results(
         sbs_scores = np.full((len(all_dims), len(group_names)), np.nan, dtype=float)
         vbs_scores = np.full((len(all_dims), len(group_names)), np.nan, dtype=float)
         gap_closure = np.full((len(all_dims), len(group_names)), np.nan, dtype=float)
+        log_performances = np.full((len(all_dims), len(group_names)), np.nan, dtype=float)
+        log_sbs_scores = np.full((len(all_dims), len(group_names)), np.nan, dtype=float)
+        log_vbs_scores = np.full((len(all_dims), len(group_names)), np.nan, dtype=float)
+        log_gap_closure = np.full((len(all_dims), len(group_names)), np.nan, dtype=float)
         dims_arr = preds["Dim"].to_numpy()
 
         for di, dval in enumerate(all_dims):
@@ -1512,6 +1550,20 @@ def output_results(
                 else:
                     gap_closure[di, gi] = (sbs - as_score) / denom
 
+                subset_perf_log = perf_rows_log[m]
+                as_score_log = float(np.mean(picked_score_log[m]))
+                vbs_log = float(np.mean(np.min(subset_perf_log, axis=1)))
+                sbs_log = float(np.mean(subset_perf_log[:, log_sbs_alg_idx]))
+                log_performances[di, gi] = as_score_log
+                log_vbs_scores[di, gi] = vbs_log
+                log_sbs_scores[di, gi] = sbs_log
+
+                denom_log = (sbs_log - vbs_log)
+                if abs(denom_log) <= 1e-12:
+                    log_gap_closure[di, gi] = 1.0 if abs(as_score_log - vbs_log) <= 1e-12 else 0.0
+                else:
+                    log_gap_closure[di, gi] = (sbs_log - as_score_log) / denom_log
+
         df_scores = pd.DataFrame(performances, columns=group_names)
         df_scores.insert(0, "Dim", all_dims)
         df_acc = pd.DataFrame(accuracies, columns=group_names)
@@ -1524,6 +1576,14 @@ def output_results(
         df_vbs.insert(0, "Dim", all_dims)
         df_gap = pd.DataFrame(gap_closure, columns=group_names)
         df_gap.insert(0, "Dim", all_dims)
+        df_log_scores = pd.DataFrame(log_performances, columns=group_names)
+        df_log_scores.insert(0, "Dim", all_dims)
+        df_log_sbs = pd.DataFrame(log_sbs_scores, columns=group_names)
+        df_log_sbs.insert(0, "Dim", all_dims)
+        df_log_vbs = pd.DataFrame(log_vbs_scores, columns=group_names)
+        df_log_vbs.insert(0, "Dim", all_dims)
+        df_log_gap = pd.DataFrame(log_gap_closure, columns=group_names)
+        df_log_gap.insert(0, "Dim", all_dims)
 
         # Keep the same print behaviour as before (overall == last row/col)
         print(
@@ -1549,11 +1609,16 @@ def output_results(
         dict_df_sbs[fold_id] = df_sbs.round(3)
         dict_df_vbs[fold_id] = df_vbs.round(3)
         dict_df_gap[fold_id] = df_gap.round(3)
+        dict_df_log_scores[fold_id] = df_log_scores.round(3)
+        dict_df_log_sbs[fold_id] = df_log_sbs.round(3)
+        dict_df_log_vbs[fold_id] = df_log_vbs.round(3)
+        dict_df_log_gap[fold_id] = df_log_gap.round(3)
 
     def _compute_sbs_vbs_on_full_df(
         *,
         use_median: bool = False,
         quantile: Optional[float] = None,
+        metric_space: str = "raw",
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """Compute SBS/VBS baselines on the full ground-truth df (protocol-invariant).
 
@@ -1569,16 +1634,26 @@ def output_results(
                 raise ValueError(f"quantile must be in [0,1], got {quantile}")
             if use_median:
                 raise ValueError("use_median and quantile are mutually exclusive")
+        metric_space = str(metric_space).lower().strip()
+        if metric_space not in {"raw", "log"}:
+            raise ValueError(f"metric_space must be 'raw' or 'log', got {metric_space!r}")
         gt = perf_by_key.reset_index().copy()  # columns: Problem, Dim, <alg...>
         gt["Problem"] = gt["Problem"].astype(str).str.lower()
         gt["Dim"] = gt["Dim"].astype(int)
 
         perf = gt[alg_cols].to_numpy(dtype=float)
+        perf_metric = _metric_space(perf, use_log=(metric_space == "log"))
 
-        if quantile is not None:
-            sbs_alg_idx = int(sbs_alg_idx_p90_global)
+        if metric_space == "log":
+            if quantile is not None:
+                sbs_alg_idx = int(log_sbs_alg_idx_p90_global)
+            else:
+                sbs_alg_idx = int(log_sbs_alg_idx_med_global) if use_median else int(log_sbs_alg_idx_global)
         else:
-            sbs_alg_idx = int(sbs_alg_idx_med_global) if use_median else int(sbs_alg_idx_global)
+            if quantile is not None:
+                sbs_alg_idx = int(sbs_alg_idx_p90_global)
+            else:
+                sbs_alg_idx = int(sbs_alg_idx_med_global) if use_median else int(sbs_alg_idx_global)
 
         fid = gt["Problem"].str.extract(r"(\d+)", expand=False).astype(int).to_numpy()
         group = np.full(fid.shape, "all", dtype=object)
@@ -1597,7 +1672,7 @@ def output_results(
                 if not np.any(m):
                     continue
 
-                subset_perf = perf[m]
+                subset_perf = perf_metric[m]
                 row_min = np.min(subset_perf, axis=1)
                 if quantile is not None:
                     vbs_scores[di, gi] = float(np.quantile(row_min, q))
@@ -1631,7 +1706,34 @@ def output_results(
         # print('out: ', out)
         return out
 
+    def _compute_concat_scores_df(
+        values_all: np.ndarray,
+        *,
+        use_median: bool = False,
+        quantile: Optional[float] = None,
+    ) -> pd.DataFrame:
+        scores = np.zeros((len(all_dims), len(group_names)), dtype=float)
+        for di, dval in enumerate(all_dims):
+            dim_mask = np.ones(len(preds_all), dtype=bool) if dval == "all" else (dims_all_arr == int(dval))
+            for gi, gname in enumerate(group_names):
+                grp_mask = np.ones(len(preds_all), dtype=bool) if gname == "all" else (group_all == gname)
+                m = dim_mask & grp_mask
+                if not np.any(m):
+                    continue
+                if quantile is not None:
+                    score = float(np.quantile(values_all[m], quantile))
+                elif use_median:
+                    score = float(np.median(values_all[m]))
+                else:
+                    score = float(np.mean(values_all[m]))
+                scores[di, gi] = score
+
+        df_scores_concat = pd.DataFrame(scores, columns=group_names)
+        df_scores_concat.insert(0, "Dim", all_dims)
+        return _avg_over_folds({"concat": df_scores_concat.round(3)})
+
     df_avg_scores = _avg_over_folds(dict_df_scores)
+    df_log_avg_scores = _avg_over_folds(dict_df_log_scores)
     # raise
     df_avg_accuracies = _avg_over_folds(dict_df_accuracies)
     df_avg_f1 = _avg_over_folds(dict_df_f1)
@@ -1644,6 +1746,9 @@ def output_results(
     df_sbs_full, df_vbs_full = _compute_sbs_vbs_on_full_df(use_median=False)
     df_avg_sbs = _avg_over_folds({"full": df_sbs_full})
     df_avg_vbs = _avg_over_folds({"full": df_vbs_full})
+    df_log_sbs_full, df_log_vbs_full = _compute_sbs_vbs_on_full_df(use_median=False, metric_space="log")
+    df_log_avg_sbs = _avg_over_folds({"full": df_log_sbs_full})
+    df_log_avg_vbs = _avg_over_folds({"full": df_log_vbs_full})
 
     # Recompute gap closure using the averaged scores table and concatenated baselines.
     def _gap_from_tables(df_scores: pd.DataFrame, df_sbs: pd.DataFrame, df_vbs: pd.DataFrame) -> pd.DataFrame:
@@ -1668,6 +1773,7 @@ def output_results(
         return df_gap.rename(columns={"index": "Problem Group"}).round(3)
 
     df_avg_gap_closure = _gap_from_tables(df_avg_scores, df_avg_sbs, df_avg_vbs)
+    df_log_avg_gap_closure = _gap_from_tables(df_log_avg_scores, df_log_avg_sbs, df_log_avg_vbs)
 
     preds_all = pd.concat([p.copy() for p in dict_df_predictions.values()], ignore_index=True).copy()
     preds_all.attrs = {}
@@ -1678,8 +1784,10 @@ def output_results(
     pred_alg_all = preds_all[alg_cols].idxmin(axis=1).to_numpy()
     all_keys = pd.MultiIndex.from_frame(preds_all[["Problem", "Dim"]])
     perf_rows_all = perf_by_key.loc[all_keys].to_numpy(dtype=float)
+    perf_rows_all_log = _metric_space(perf_rows_all, use_log=True)
     pred_idx_all = pd.Series(pred_alg_all).map(col_to_idx).to_numpy(dtype=int)
     picked_score_all = perf_rows_all[np.arange(len(perf_rows_all)), pred_idx_all]
+    picked_score_all_log = perf_rows_all_log[np.arange(len(perf_rows_all_log)), pred_idx_all]
 
     fid_all = preds_all["Problem"].str.extract(r"(\d+)", expand=False).astype(int).to_numpy()
     group_all = np.full(fid_all.shape, "all", dtype=object)
@@ -1687,49 +1795,32 @@ def output_results(
         group_all[(fid_all >= lo) & (fid_all <= hi)] = name
 
     dims_all_arr = preds_all["Dim"].to_numpy()
-    median_scores = np.zeros((len(all_dims), len(group_names)), dtype=float)
-
-    for di, dval in enumerate(all_dims):
-        dim_mask = np.ones(len(preds_all), dtype=bool) if dval == "all" else (dims_all_arr == int(dval))
-        for gi, gname in enumerate(group_names):
-            grp_mask = np.ones(len(preds_all), dtype=bool) if gname == "all" else (group_all == gname)
-            m = dim_mask & grp_mask
-            if not np.any(m):
-                continue
-            as_med = float(np.median(picked_score_all[m]))
-            median_scores[di, gi] = as_med
-
-    df_median_scores_concat = pd.DataFrame(median_scores, columns=group_names)
-    df_median_scores_concat.insert(0, "Dim", all_dims)
-    df_median_scores = _avg_over_folds({"concat": df_median_scores_concat.round(3)})
+    df_median_scores = _compute_concat_scores_df(picked_score_all, use_median=True)
+    df_log_median_scores = _compute_concat_scores_df(picked_score_all_log, use_median=True)
 
     # Median baselines are computed on the full ground-truth df (protocol-invariant).
     df_median_sbs_full, df_median_vbs_full = _compute_sbs_vbs_on_full_df(use_median=True)
     df_median_sbs = _avg_over_folds({"full": df_median_sbs_full})
     df_median_vbs = _avg_over_folds({"full": df_median_vbs_full})
     df_median_gap_closure = _gap_from_tables(df_median_scores, df_median_sbs, df_median_vbs)
+    df_log_median_sbs_full, df_log_median_vbs_full = _compute_sbs_vbs_on_full_df(use_median=True, metric_space="log")
+    df_log_median_sbs = _avg_over_folds({"full": df_log_median_sbs_full})
+    df_log_median_vbs = _avg_over_folds({"full": df_log_median_vbs_full})
+    df_log_median_gap_closure = _gap_from_tables(df_log_median_scores, df_log_median_sbs, df_log_median_vbs)
 
     # 90th percentile (p90) score on the concatenation (treat all held-out cases together).
-    p90_scores = np.zeros((len(all_dims), len(group_names)), dtype=float)
-    for di, dval in enumerate(all_dims):
-        dim_mask = np.ones(len(preds_all), dtype=bool) if dval == "all" else (dims_all_arr == int(dval))
-        for gi, gname in enumerate(group_names):
-            grp_mask = np.ones(len(preds_all), dtype=bool) if gname == "all" else (group_all == gname)
-            m = dim_mask & grp_mask
-            if not np.any(m):
-                continue
-            as_p90 = float(np.quantile(picked_score_all[m], 0.9))
-            p90_scores[di, gi] = as_p90
-
-    df_p90_scores_concat = pd.DataFrame(p90_scores, columns=group_names)
-    df_p90_scores_concat.insert(0, "Dim", all_dims)
-    df_p90_scores = _avg_over_folds({"concat": df_p90_scores_concat.round(3)})
+    df_p90_scores = _compute_concat_scores_df(picked_score_all, quantile=0.9)
+    df_log_p90_scores = _compute_concat_scores_df(picked_score_all_log, quantile=0.9)
 
     # p90 baselines are computed on the full ground-truth df (protocol-invariant).
     df_p90_sbs_full, df_p90_vbs_full = _compute_sbs_vbs_on_full_df(quantile=0.9)
     df_p90_sbs = _avg_over_folds({"full": df_p90_sbs_full})
     df_p90_vbs = _avg_over_folds({"full": df_p90_vbs_full})
     df_p90_gap_closure = _gap_from_tables(df_p90_scores, df_p90_sbs, df_p90_vbs)
+    df_log_p90_sbs_full, df_log_p90_vbs_full = _compute_sbs_vbs_on_full_df(quantile=0.9, metric_space="log")
+    df_log_p90_sbs = _avg_over_folds({"full": df_log_p90_sbs_full})
+    df_log_p90_vbs = _avg_over_folds({"full": df_log_p90_vbs_full})
+    df_log_p90_gap_closure = _gap_from_tables(df_log_p90_scores, df_log_p90_sbs, df_log_p90_vbs)
 
     pick_rate = preds_all[alg_cols].idxmin(axis=1).value_counts(normalize=True).sort_values(ascending=False)
     vbs_pick_rate = true_best_alg.loc[all_keys].value_counts(normalize=True).sort_values(ascending=False)
@@ -1738,6 +1829,9 @@ def output_results(
         "scores": df_avg_scores,
         "median_scores": df_median_scores,
         "p90_scores": df_p90_scores,
+        "log_scores": df_log_avg_scores,
+        "log_median_scores": df_log_median_scores,
+        "log_p90_scores": df_log_p90_scores,
         "accuracies": df_avg_accuracies,
         "accuracies_by_fold": dict_df_accuracies,
         "cat_accuracies": df_avg_cat_acc,
@@ -1748,11 +1842,20 @@ def output_results(
         "sbs": df_avg_sbs,
         "vbs": df_avg_vbs,
         "gap_closure": df_avg_gap_closure,
+        "log_sbs": df_log_avg_sbs,
+        "log_vbs": df_log_avg_vbs,
+        "log_gap_closure": df_log_avg_gap_closure,
         "median_sbs": df_median_sbs,
         "median_vbs": df_median_vbs,
         "median_gap_closure": df_median_gap_closure,
+        "log_median_sbs": df_log_median_sbs,
+        "log_median_vbs": df_log_median_vbs,
+        "log_median_gap_closure": df_log_median_gap_closure,
         "p90_sbs": df_p90_sbs,
         "p90_vbs": df_p90_vbs,
         "p90_gap_closure": df_p90_gap_closure,
+        "log_p90_sbs": df_log_p90_sbs,
+        "log_p90_vbs": df_log_p90_vbs,
+        "log_p90_gap_closure": df_log_p90_gap_closure,
         "preds_all": preds_all,
     }

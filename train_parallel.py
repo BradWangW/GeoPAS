@@ -19,7 +19,7 @@ import time
 import multiprocessing as mp
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -72,57 +72,78 @@ def _resolve_gpus(gpus_arg: str) -> List[int]:
 class Task:
     protocol: str
     task_id: str
-    payload: Dict[str, object]
+    payload: Dict[str, Any]
 
 
 def _write_metrics_csv(metrics: Dict[str, object], out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    def _as_frame(value: object) -> pd.DataFrame:
+        if not isinstance(value, pd.DataFrame):
+            raise TypeError(f"Expected DataFrame, got {type(value).__name__}")
+        return value
+
+    def _as_series(value: object) -> pd.Series:
+        if not isinstance(value, pd.Series):
+            raise TypeError(f"Expected Series, got {type(value).__name__}")
+        return value
+
     with out_path.open("w") as f:
-        f.write("Mean\n")
-        f.write("AS\n")
-        metrics["scores"].to_csv(f, index=False)
-        f.write("\nVBS\n")
-        metrics["vbs"].to_csv(f, index=False)
-        f.write("\nSBS\n")
-        metrics["sbs"].to_csv(f, index=False)
-        f.write("\nGap_Closure\n")
-        metrics["gap_closure"].to_csv(f, index=False)
+        def _write_block(title: str, *, scores_key: str, vbs_key: str, sbs_key: str, gap_key: str) -> None:
+            f.write(f"{title}\n")
+            f.write("AS\n")
+            _as_frame(metrics[scores_key]).to_csv(f, index=False)
+            f.write("\nVBS\n")
+            _as_frame(metrics[vbs_key]).to_csv(f, index=False)
+            f.write("\nSBS\n")
+            _as_frame(metrics[sbs_key]).to_csv(f, index=False)
+            f.write("\nGap_Closure\n")
+            _as_frame(metrics[gap_key]).to_csv(f, index=False)
 
-        f.write("\nMedian\n")
-        f.write("AS\n")
-        metrics["median_scores"].to_csv(f, index=False)
-        f.write("\nVBS\n")
-        metrics["median_vbs"].to_csv(f, index=False)
-        f.write("\nSBS\n")
-        metrics["median_sbs"].to_csv(f, index=False)
-        f.write("\nGap_Closure\n")
-        metrics["median_gap_closure"].to_csv(f, index=False)
-
-        f.write("\nP90\n")
-        f.write("AS\n")
-        metrics["p90_scores"].to_csv(f, index=False)
-        f.write("\nVBS\n")
-        metrics["p90_vbs"].to_csv(f, index=False)
-        f.write("\nSBS\n")
-        metrics["p90_sbs"].to_csv(f, index=False)
-        f.write("\nGap_Closure\n")
-        metrics["p90_gap_closure"].to_csv(f, index=False)
+        _write_block("Mean", scores_key="scores", vbs_key="vbs", sbs_key="sbs", gap_key="gap_closure")
+        f.write("\n")
+        _write_block(
+            "Median",
+            scores_key="median_scores",
+            vbs_key="median_vbs",
+            sbs_key="median_sbs",
+            gap_key="median_gap_closure",
+        )
+        f.write("\n")
+        _write_block("P90", scores_key="p90_scores", vbs_key="p90_vbs", sbs_key="p90_sbs", gap_key="p90_gap_closure")
+        f.write("\n")
+        _write_block("Log_Mean", scores_key="log_scores", vbs_key="log_vbs", sbs_key="log_sbs", gap_key="log_gap_closure")
+        f.write("\n")
+        _write_block(
+            "Log_Median",
+            scores_key="log_median_scores",
+            vbs_key="log_median_vbs",
+            sbs_key="log_median_sbs",
+            gap_key="log_median_gap_closure",
+        )
+        f.write("\n")
+        _write_block(
+            "Log_P90",
+            scores_key="log_p90_scores",
+            vbs_key="log_p90_vbs",
+            sbs_key="log_p90_sbs",
+            gap_key="log_p90_gap_closure",
+        )
 
         f.write("\nAccuracies\n")
-        metrics["accuracies"].to_csv(f, index=False)
+        _as_frame(metrics["accuracies"]).to_csv(f, index=False)
 
         cat_acc = metrics.get("cat_accuracies")
-        if hasattr(cat_acc, "to_csv"):
+        if isinstance(cat_acc, pd.DataFrame):
             f.write("\nCatastrophe_Accuracies\n")
             cat_acc.to_csv(f, index=False)
 
         f.write("\nF1\n")
-        metrics["f1"].to_csv(f, index=False)
+        _as_frame(metrics["f1"]).to_csv(f, index=False)
         f.write("\nPick_Rate\n")
-        metrics["pick_rate"].to_csv(f, header=["rate"])
+        _as_series(metrics["pick_rate"]).to_csv(f, header=["rate"])
         f.write("\nVBS_Pick_Rate\n")
-        metrics["vbs_pick_rate"].to_csv(f, header=["rate"])
+        _as_series(metrics["vbs_pick_rate"]).to_csv(f, header=["rate"])
 
 
 def _canonical_problem_list(df: pd.DataFrame) -> List[str]:
@@ -296,8 +317,11 @@ def _run_orchestrator(args: argparse.Namespace) -> None:
     if not gpus:
         raise RuntimeError("No GPUs detected; set --gpus explicitly or ensure nvidia-smi works")
 
-    max_parallel = int(args.max_parallel) if args.max_parallel is not None else len(gpus)
-    max_parallel = max(1, min(max_parallel, len(gpus)))
+    jobs_per_gpu = max(1, int(args.jobs_per_gpu))
+    gpu_slots: List[Tuple[int, int]] = [(slot_id, gpu) for slot_id, gpu in enumerate(gpus * jobs_per_gpu)]
+
+    max_parallel = int(args.max_parallel) if args.max_parallel is not None else len(gpu_slots)
+    max_parallel = max(1, min(max_parallel, len(gpu_slots)))
 
     all_tasks: List[Task] = []
     tasks_by_protocol: Dict[str, List[Task]] = {}
@@ -312,7 +336,7 @@ def _run_orchestrator(args: argparse.Namespace) -> None:
         tasks_by_protocol[p] = tasks
 
     if args.dry_run:
-        print(f"GPUs: {gpus} (max_parallel={max_parallel})")
+        print(f"GPUs: {gpus} (jobs_per_gpu={jobs_per_gpu}, max_parallel={max_parallel})")
         print(f"Tasks: {len(all_tasks)}")
         by_p = {p: len(tasks_by_protocol.get(p, [])) for p in protocols}
         print("Per protocol:", json.dumps(by_p, indent=2))
@@ -321,10 +345,11 @@ def _run_orchestrator(args: argparse.Namespace) -> None:
     # Simple GPU scheduler: keep <= max_parallel processes running.
     pending = all_tasks.copy()
     ctx = mp.get_context("spawn")
-    running: Dict[int, mp.Process] = {}
+    running: Dict[int, Any] = {}
     running_task: Dict[int, Task] = {}
+    running_gpu: Dict[int, int] = {}
 
-    def start_task(gpu: int, task: Task) -> None:
+    def start_task(slot_id: int, gpu: int, task: Task) -> None:
         task_out = tmp_dir / f"{task.protocol}__{task.task_id}.pkl"
         p = ctx.Process(
             target=_run_one_task,
@@ -358,46 +383,57 @@ def _run_orchestrator(args: argparse.Namespace) -> None:
                 float(args.cat_loss_weight),
                 float(args.cat_tau),
                 float(args.cat_penalty),
+                float(args.val_ratio_lpo),
+                float(args.val_ratio_lio),
+                float(args.val_ratio_random),
                 int(args.early_stopping_patience),
                 tb_log_dir,
                 bool(args.tb_log_val),
             ),
         )
         p.start()
-        running[gpu] = p
-        running_task[gpu] = task
+        running[slot_id] = p
+        running_task[slot_id] = task
+        running_gpu[slot_id] = gpu
 
-    free_gpus = gpus[:]
+    free_slots = gpu_slots[:]
     started = 0
     completed = 0
 
     def poll_finished() -> None:
         nonlocal completed
-        finished_gpus: List[int] = []
-        for gpu, proc in running.items():
+        finished_slots: List[int] = []
+        for slot_id, proc in running.items():
             if proc.is_alive():
                 continue
-            task = running_task[gpu]
+            task = running_task[slot_id]
+            gpu = running_gpu[slot_id]
             rc = proc.exitcode
             if rc != 0:
-                raise RuntimeError(f"Task failed on GPU {gpu}: {task.protocol}/{task.task_id} (exit {rc})")
-            finished_gpus.append(gpu)
+                raise RuntimeError(
+                    f"Task failed on GPU {gpu} (slot {slot_id}): {task.protocol}/{task.task_id} (exit {rc})"
+                )
+            finished_slots.append(slot_id)
 
-        for gpu in finished_gpus:
-            running.pop(gpu, None)
-            running_task.pop(gpu, None)
-            free_gpus.append(gpu)
+        for slot_id in finished_slots:
+            gpu = running_gpu.pop(slot_id)
+            running.pop(slot_id, None)
+            running_task.pop(slot_id, None)
+            free_slots.append((slot_id, gpu))
             completed += 1
 
-    print(f"Scheduling {len(pending)} tasks across GPUs={gpus} (max_parallel={max_parallel})")
+    print(
+        f"Scheduling {len(pending)} tasks across GPUs={gpus} "
+        f"(jobs_per_gpu={jobs_per_gpu}, max_parallel={max_parallel})"
+    )
 
     while pending or running:
         poll_finished()
 
-        while pending and free_gpus and (len(running) < max_parallel):
-            gpu = free_gpus.pop(0)
+        while pending and free_slots and (len(running) < max_parallel):
+            slot_id, gpu = free_slots.pop(0)
             task = pending.pop(0)
-            start_task(gpu, task)
+            start_task(slot_id, gpu, task)
             started += 1
 
         if running:
@@ -485,6 +521,9 @@ def _run_one_task(
     cat_loss_weight: float,
     cat_tau: float,
     cat_penalty: float,
+    val_ratio_lpo: float,
+    val_ratio_lio: float,
+    val_ratio_random: float,
     early_stopping_patience: int,
     tb_log_dir: Optional[str],
     tb_log_val: bool,
@@ -498,11 +537,10 @@ def _run_one_task(
     from functions.model_interface import (
         MultiViewNPZDataset,
         SubsetMultiViewNPZDataset,
+        _train_predict_from_datasets,
         _train_predict_one_split,
         default_data_dir,
-        make_dataloader,
         set_seed,
-        single_train,
     )
 
     df = pd.read_csv(csv_path)
@@ -514,7 +552,7 @@ def _run_one_task(
     data_dir = default_data_dir(data_root, resolution)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    payload = dict(task.payload)
+    payload: Dict[str, Any] = dict(task.payload)
     instances_all = [int(i) for i in instances_all]
 
     set_seed(int(seed))
@@ -525,8 +563,13 @@ def _run_one_task(
     effective_cat_loss_weight = (float(cat_loss_weight) if bool(dual_head) else 0.0)
     effective_cat_tau = float(cat_tau)
     effective_cat_penalty = (float(cat_penalty) if bool(dual_head) else 0.0)
+    protocol_val_ratio = {
+        "lpo": float(val_ratio_lpo),
+        "lio": float(val_ratio_lio),
+        "random": float(val_ratio_random),
+    }[task.protocol]
 
-    shared_split_kwargs = dict(
+    shared_split_kwargs: Dict[str, Any] = dict(
         data_dir=data_dir,
         num_repetitions=num_repetitions,
         k_views=k_views,
@@ -548,6 +591,7 @@ def _run_one_task(
         tail_lam_cap=float(tail_lam_cap),
         tail_lam_thr=float(tail_lam_thr),
         tail_scale=float(tail_scale),
+        val_ratio=float(protocol_val_ratio),
         early_stopping_patience=int(early_stopping_patience),
         tb_log_dir=tb_log_dir_use,
         tb_run_name=tb_run_name,
@@ -566,6 +610,7 @@ def _run_one_task(
             **shared_split_kwargs,
         )
         out.attrs["cv_protocol"] = "leave_instance_out"
+        out.attrs["val_ratio"] = float(protocol_val_ratio)
         out.attrs["train_instances"] = train_insts
         out.attrs["test_instances"] = [test_inst]
 
@@ -590,6 +635,7 @@ def _run_one_task(
             **shared_split_kwargs,
         )
         out.attrs["cv_protocol"] = "leave_problem_out"
+        out.attrs["val_ratio"] = float(protocol_val_ratio)
         out.attrs["test_problems"] = [test_prob]
         out.attrs["instances"] = instances_all
 
@@ -653,60 +699,62 @@ def _run_one_task(
         test_ds = SubsetMultiViewNPZDataset(base_ds, test_idx, cache=cache_test)
 
         fold_loader_seed = int(seed) + int(split_idx) * 1000
-        train_loader = make_dataloader(
-            train_ds,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            seed=int(fold_loader_seed + 11),
-            pin_memory=True,
-            persistent_workers=(num_workers > 0),
-        )
-        test_loader = make_dataloader(
-            test_ds,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=max(1, num_workers // 2),
-            seed=int(fold_loader_seed + 22),
-            pin_memory=True,
-            persistent_workers=(num_workers > 0),
-        )
+        penalty = None
+        if bool(tail_penalty):
+            from functions.model_interface import compute_risk_penalty, tail_table
 
-        model = make_model()
-        preds, tb_history = single_train(
-            model,
-            train_loader,
-            test_loader,
+            # The relERT table is only indexed by (problem, dim), not by instance.
+            # For random CV, estimate the tail prior from the subset of rows covered
+            # by the fold's training groups rather than from the full dataframe.
+            train_problem_dim_keys = {
+                (f"f{int(fid)}", int(dim))
+                for fid, dim, _instance in (group_keys[gi] for gi in train_group_ids)
+            }
+            df_tail_source = df.copy()
+            df_tail_source["Problem"] = df_tail_source["Problem"].astype(str).str.lower()
+            df_tail_source["Dim"] = df_tail_source["Dim"].astype(int)
+            train_mask = [
+                (problem, dim) in train_problem_dim_keys
+                for problem, dim in zip(df_tail_source["Problem"], df_tail_source["Dim"])
+            ]
+            df_tail_source = df_tail_source.loc[train_mask].reset_index(drop=True)
+            if df_tail_source.empty:
+                raise RuntimeError(
+                    "Random fold produced no row-level training data for tail-penalty estimation"
+                )
+
+            df_tail_train = tail_table(df_tail_source)
+            penalty = float(tail_scale) * compute_risk_penalty(
+                df_tail_train,
+                lam_cap=float(tail_lam_cap),
+                lam_thr=float(tail_lam_thr),
+            )
+
+        out = _train_predict_from_datasets(
+            train_ds=train_ds,
+            test_ds=test_ds,
+            alg_cols=alg_cols,
+            make_model=make_model,
             device=device,
+            batch_size=batch_size,
             num_epochs=num_epochs,
             lr=lr,
             weight_decay=weight_decay,
+            num_workers=num_workers,
+            loader_seed_base=fold_loader_seed,
             pbar_head=f"[train random s{split_idx}]",
             tb_log_dir=tb_log_dir_use,
             tb_run_name=tb_run_name,
             tb_log_val=bool(tb_log_val),
+            val_ratio=float(protocol_val_ratio),
+            early_stopping_patience=int(early_stopping_patience),
             cat_loss_weight=effective_cat_loss_weight,
             cat_tau=effective_cat_tau,
             cat_penalty=effective_cat_penalty,
-            early_stopping_patience=int(early_stopping_patience),
-            return_cat_arrays=False,
-            return_history=True,
+            penalty=penalty,
         )
-
-        if bool(tail_penalty):
-            from functions.model_interface import tail_table, compute_risk_penalty
-
-            df_tail_train = tail_table(df)
-            penalty = compute_risk_penalty(df_tail_train, lam_cap=float(tail_lam_cap), lam_thr=float(tail_lam_thr))
-            preds = preds + float(tail_scale) * penalty[None, :]
-
-        out = pd.DataFrame(preds, columns=alg_cols)
-        out.insert(0, "Repetition", test_ds.repetitions)
-        out.insert(0, "Instance", test_ds.instance_ids)
-        out.insert(0, "Dim", test_ds.dims)
-        out.insert(0, "Problem", test_ds.problem_ids)
-        out.attrs["tb_history"] = tb_history
         out.attrs["cv_protocol"] = "kfold_instance_cv"
+        out.attrs["val_ratio"] = float(protocol_val_ratio)
         out.attrs["split_unit"] = "problem_dim_instance"
         out.attrs["n_folds"] = int(k_folds)
         out.attrs["fold_idx"] = int(split_idx)
@@ -716,9 +764,6 @@ def _run_one_task(
         out.attrs["test_ratio"] = float(len(test_group_ids) / float(n_groups))
         out.attrs["n_cases"] = int(n_cases)
         out.attrs["instances"] = instances_all
-
-        del model
-        torch.cuda.empty_cache()
 
     else:
         raise ValueError(f"Unknown protocol: {task.protocol}")
@@ -737,6 +782,24 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-repetitions", type=int, default=10)
     p.add_argument("--instances-all", default="1,2,3,4,5")
     p.add_argument("--early-stopping-patience", type=int, default=15)
+    p.add_argument(
+        "--val-ratio-lpo",
+        type=float,
+        default=0.0,
+        help="Training-set validation split used for early stopping during LPO folds (default: 0.0 = disabled)",
+    )
+    p.add_argument(
+        "--val-ratio-lio",
+        type=float,
+        default=0.1,
+        help="Training-set validation split used for early stopping during LIO folds (default: 0.1)",
+    )
+    p.add_argument(
+        "--val-ratio-random",
+        type=float,
+        default=0.1,
+        help="Training-set validation split used for early stopping during RANDOM folds (default: 0.1)",
+    )
 
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--num-epochs", type=int, default=50)
@@ -769,6 +832,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.set_defaults(strict=True)
 
     p.add_argument("--gpus", default="auto", help="GPU indices to use, e.g. '0,1,2' or 'auto'")
+    p.add_argument(
+        "--jobs-per-gpu",
+        type=int,
+        default=1,
+        help="How many independent training jobs may share each selected GPU (default: 1)",
+    )
     p.add_argument("--max-parallel", type=int, default=None)
     p.add_argument("--out-dir", default="results/bbob")
     p.add_argument("--dry-run", action="store_true")
@@ -806,6 +875,11 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _build_parser().parse_args()
     args.instances_all = _parse_int_list(args.instances_all)
+
+    for name in ("val_ratio_lpo", "val_ratio_lio", "val_ratio_random"):
+        value = float(getattr(args, name))
+        if not (0.0 <= value < 1.0):
+            raise ValueError(f"{name} must be in [0, 1), got {value}")
 
     print('Resolution', args.resolution, 'K-Views', args.k_views)
 

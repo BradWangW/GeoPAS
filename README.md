@@ -1,111 +1,63 @@
-# AS_BBOB_SOO
+# GeoPAS
 
-Train and evaluate an algorithm-selection model on BBOB-style data with three cross-validation protocols:
+This workspace contains the GeoPAS training and analysis pipeline for algorithm selection on BBOB using multi-view two-dimensional slices of black-box functions.
 
-- **LPO**: leave-problem-out
-- **LIO**: leave-instance-out
-- **Random**: random split over **cases** (problem × dim × instance × repetition)
+## Structure
 
-The main entrypoint is a multi-GPU parallel runner that schedules CV folds/splits across available GPUs and writes:
+- `train_parallel.py`: main training entrypoint; schedules cross-validation tasks across GPUs and writes per-protocol summary and prediction files.
+- `train.sh`: local sweep wrapper around `train_parallel.py`; defines the parameter grid and output layout used in the current experiments.
+- `functions/model.py`: convolutional selector model.
+- `functions/model_interface.py`: dataset loading, training, evaluation, and result-table generation.
+- `data_generation/plots/plot_generation_soo_extensive.py`: generates `.npz` multi-view training data from BBOB problems.
+- `data_generation/performances/ERT_cal.ipynb`: computes reference performance tables used to build relERT labels.
+- `analysis.ipynb`: validates result tables and performs protocol-level and cell-level failure analysis.
+- `concatenate_over_parameters.ipynb`: aggregates many `res_*.csv` outputs into sectioned comparison files.
+- `robustness_over_budget.ipynb`: compiles aggregated result tables into `res`, `k_views`, and budget summaries and heatmaps.
 
-- A **summary CSV** (mean + median metrics)
-- A **per-sample predictions table** with `Problem, Dim, Instance, Repetition, <model predictions...>`
+## Pipeline
 
-## Repository layout
+1. Build a reference relERT table for the candidate algorithms.
+2. Generate multi-view slice data for each BBOB problem, dimension, instance, and repetition.
+3. Train and evaluate GeoPAS with one of the supported protocols: `random`, `lpo`, or `lio`.
+4. Collect the outputs written by `train_parallel.py`:
+	 - `res_*.csv`: summary tables for AS, SBS, VBS, gap closure, accuracies, F1, and pick rates.
+	 - `preds_*.csv.gz`: per-sample predicted scores and realised selections.
+5. Aggregate results across parameter settings with `concatenate_over_parameters.ipynb`.
+6. Inspect budget sensitivity with `robustness_over_budget.ipynb`.
+7. Run `analysis.ipynb` for validation and failure analysis.
 
-- `functions/model.py`: model definition
-- `functions/model_interface.py`: dataset + training loop + CV protocols + metric/reporting utilities
-- `train_parallel.py`: multi-GPU CV orchestrator (random/LPO/LIO)
-- `train.sh`: minimal convenience wrapper for `train_parallel.py`
-- `data/`: example CSVs and (optionally) BBOB `.npz` data
+## Data Expectations
 
-## Environment
+- Training expects a relERT CSV indexed by `Problem` and `Dim`.
+- Training data are stored under a root of the form `.../res_<resolution>/` and loaded from `.npz` files named like `f{fid}_i{instance}_dim{dim}_rep{rep}.npz`.
+- The default shell wrapper assumes the larger project layout under `/data1/home/jw1017/AS_BBO_REBUILT/`; adjust those paths before reusing the workspace elsewhere.
 
-This project is intended to run in the `as_bbo` conda environment.
+## Running
+
+Create the environment:
 
 ```bash
 conda env create -f environment.yaml
 conda activate as_bbo
 ```
 
-## Data expectations
-
-`train_parallel.py` consumes a CSV with at least:
-
-- Column 0–1: metadata columns (the code expects a `Problem` column; typical files also include `Dim`)
-- Remaining columns: algorithm performance targets (one column per algorithm)
-
-The corresponding `.npz` files are expected under `--data-root` (see `functions/model_interface.py` for the exact naming/lookup conventions).
-
-## Usage
-
-### Quick run (via bash wrapper)
-
-Edit variables at the top of `train.sh` (protocol, CSV, data root, etc.), then:
+Run the configured sweep:
 
 ```bash
 bash train.sh
 ```
 
-You can also override parameters via environment variables by editing the script (it is intentionally minimal).
-
-### Run directly (recommended)
+Or run the orchestrator directly with explicit paths:
 
 ```bash
 python train_parallel.py \
-  --protocol all \
-  --csv data/log_relert_bbob.csv \
-  --data-root data/bbob \
-  --resolution 16 \
-  --k-views 16 \
-  --num-repetitions 10 \
-  --batch-size 32 \
-  --num-epochs 50 \
-  --lr 1e-3 \
-  --weight-decay 1e-5 \
-  --num-workers 4 \
-  --seed 42 \
-  --test-ratio 0.2 \
-  --n-splits 5 \
-  --gpus auto
+	--protocol all \
+	--csv /path/to/relert.csv \
+	--data-root /path/to/data_root \
+	--out-dir /path/to/results
 ```
 
-Notes:
-- `--protocol`: `random`, `lpo`, `lio`, or `all`.
-- `--gpus auto` uses `nvidia-smi` if available; otherwise falls back to `CUDA_VISIBLE_DEVICES` or GPU `0`.
-- `--max-parallel` limits concurrent trainings (default: number of selected GPUs).
+## Notes
 
-### Dry run (task enumeration only)
-
-```bash
-python train_parallel.py --dry-run --protocol all --gpus 0
-```
-
-## Outputs
-
-Results are written per protocol under:
-
-- `results/bbob/<PROTOCOL>/res_<resolution>_k_views_<k>.csv`
-- `results/bbob/<PROTOCOL>/preds_<resolution>_k_views_<k>.csv.gz`
-
-Where `<PROTOCOL>` is one of:
-
-- `LPO`
-- `LIO`
-- `RANDOM`
-
-The summary CSV is structured as:
-
-- Mean: `AS`, `VBS`, `SBS`, `Gap_Closure`
-- Median: `AS`, `VBS`, `SBS`, `Gap_Closure`
-- Then: `Accuracies`, `F1`, `Pick_Rate`, `VBS_Pick_Rate`
-
-## TensorBoard
-
-TensorBoard support is implemented in the training loop in `functions/model_interface.py` (via `torch.utils.tensorboard`).
-
-If you want TensorBoard runs for CV tasks, add TB arguments where `single_train(...)` is called (the hooks are already present).
-
-## License
-
-Add a license if/when you publish this repository.
+- `train.sh` is a local experiment launcher, not a portable interface; it currently contains machine-specific absolute paths.
+- The notebooks are analysis and aggregation utilities layered on top of the CSV outputs written by the training pipeline.

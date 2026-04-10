@@ -5,6 +5,8 @@ set -euo pipefail
 # Usage examples:
 #   bash train.sh
 #   PROTOCOL=all GPUS=0,1,2,3 MAX_PARALLEL=4 bash train.sh
+#   JOBS_PER_GPU=2 MAX_PARALLEL=16 bash train.sh
+#   EARLY_STOPPING_ENABLED=0 bash train.sh
 #   SKIP_EXISTING=1 bash train.sh
 #   # NOTE: `output_results` expects relERT (>= 1). If you pass log-domain CSVs here,
 #   # your reported AS can be < 1 and you may be mixing domains.
@@ -26,23 +28,32 @@ LOG_UNIFORM_SCALE="true"
 
 PROTOCOLS=("lpo" "lio" "random")                # "lpo", "lio", or "random"
 CSV="/data1/home/jw1017/AS_BBO_REBUILT/data/bbob_by_deepela/relert.csv"      # protocol CSV file
-DATA_ROOT="/data1/home/jw1017/AS_BBO_REBUILT/data/bbob_by_deepela//maxscale_${ELL_MAX}_logscale_${LOG_UNIFORM_SCALE}/"
+DATA_ROOT="/data1/home/jw1017/AS_BBO_REBUILT/data/bbob_by_deepela/maxscale_${ELL_MAX}_logscale_${LOG_UNIFORM_SCALE}/"
+# RESOLUTIONS=(8 16 32 64)
+# KS_VIEWS=(1 2 4 8 16 32 64 128)
 RESOLUTIONS=(8)
 KS_VIEWS=(32)
 NUM_REPETITIONS="10"
 
 BATCH_SIZE="16"
+# NUM_EPOCHS="100"
+# LR="3e-3"
 NUM_EPOCHS="50"
 LR="1e-3"
-WEIGHT_DECAY="0"
+WEIGHT_DECAY="3e-4"
 NUM_WORKERS="3"
-EARLY_STOPPING_PATIENCE="100"
+EARLY_STOPPING_ENABLED="0"   # 1: enable validation-based early stopping, 0: train on the full training split
+EARLY_STOPPING_PATIENCE="10"
+VAL_RATIO_LPO="0.0"
+VAL_RATIO_LIO="0.1"
+VAL_RATIO_RANDOM="0.1"
 
-SEED=17
+SEED="17"
 TEST_RATIO="0.2"
 N_SPLITS="5"
 
 GPUS="auto"                 # "auto" or comma-separated GPU indices (e.g. 0,1,2,3)
+JOBS_PER_GPU="1"            # independent jobs allowed to share each selected GPU
 MAX_PARALLEL=""             # empty = default to number of GPUs
 OUT_DIR_BASE="/data1/home/jw1017/AS_BBO_REBUILT/results/bbob_by_deepela/results/bbob"
 SKIP_EXISTING="${SKIP_EXISTING:-0}"   # 1: skip configs whose final results CSV already exists
@@ -58,29 +69,29 @@ CACHE_TEST="0"               # 1 to cache test samples in RAM per worker
 # Model/score sweep options
 TARGET_SCALE_LIST=(log)        # 'log' trains on log(relERT); 'raw' trains on relERT
 TAIL_PENALTY_LIST=(1)              # 1: enable tail penalty, 0: disable
-TAIL_LAM_CAP_LIST=(3.0 4.0 5.0)
-TAIL_LAM_THR_LIST=(5.0 6.0 7.0)
+TAIL_LAM_CAP_LIST=(3.0)
+TAIL_LAM_THR_LIST=(3.0)
+# TAIL_LAM_CAP_LIST=(20.086)
+# TAIL_LAM_THR_LIST=(20.086)
 TAIL_SCALE_LIST=(1.0)
 
 DUAL_HEAD_LIST=(1)                # 1: regression+cat head, 0: regression only
 # CAT_LOSS_WEIGHT_LIST=(5.0 10.0 15.0)
 # CAT_TAU_LIST=(0.2 0.3)
 # CAT_PENALTY_LIST=(10.0 15.0 20.0)
-CAT_LOSS_WEIGHT_LIST=(5.0 10.0)
-CAT_TAU_LIST=(0.3 0.5)
-CAT_PENALTY_LIST=(5.0 10.0 15.0)
+CAT_LOSS_WEIGHT_LIST=(10.0)
+CAT_TAU_LIST=(0.5)
+CAT_PENALTY_LIST=(10.51) # approx ln(36690) to target catastrophes
+# CAT_PENALTY_LIST=(36690) # approx ln(36690) to target catastrophes
 
-# Model/score options
-# Model/score sweep options
-# TARGET_SCALE_LIST=(log)        # 'log' trains on log(relERT); 'raw' trains on relERT
-# TAIL_PENALTY_LIST=(1)              # 1: enable tail penalty, 0: disable
-# TAIL_LAM_CAP_LIST=(1.0 3.0 5.0)
-# TAIL_LAM_THR_LIST=(1.0 3.0 5.0)
-# TAIL_SCALE="1.0"
-# DUAL_HEAD_LIST=(1)                # 1: regression+cat head, 0: regression only
-# CAT_LOSS_WEIGHT_LIST=(5.0 10.0 15.0)
-# CAT_TAU_LIST=(0.2 0.3 0.4)
-# CAT_PENALTY_LIST=(5.0 10.0 15.0)
+effective_val_ratio_lpo="$VAL_RATIO_LPO"
+effective_val_ratio_lio="$VAL_RATIO_LIO"
+effective_val_ratio_random="$VAL_RATIO_RANDOM"
+if [[ "$EARLY_STOPPING_ENABLED" != "1" ]]; then
+	effective_val_ratio_lpo="0.0"
+	effective_val_ratio_lio="0.0"
+	effective_val_ratio_random="0.0"
+fi
 
 echo "Running train.py"
 echo "  python:     $PYTHON_BIN"
@@ -88,10 +99,13 @@ echo "  protocols:   $PROTOCOLS"
 echo "  csv:        $CSV"
 echo "  data_root:  $DATA_ROOT" 
 echo "  gpus:       $GPUS"
+echo "  jobs/gpu:   $JOBS_PER_GPU"
+echo "  early_stop: enabled=$EARLY_STOPPING_ENABLED patience=$EARLY_STOPPING_PATIENCE"
+echo "  val_ratio:  lpo=$effective_val_ratio_lpo lio=$effective_val_ratio_lio random=$effective_val_ratio_random"
 echo "  dual_head:  $DUAL_HEAD_LIST"
 echo "  tail_pen:   $TAIL_PENALTY_LIST"
 echo "  skip_existing: $SKIP_EXISTING"
-echo "Total number of runs: $(( ${#PROTOCOLS[@]} * ${#RESOLUTIONS[@]} * ${#KS_VIEWS[@]} * ${#TARGET_SCALE_LIST[@]} * ${#TAIL_PENALTY_LIST[@]} * ${#TAIL_LAM_CAP_LIST[@]} * ${#TAIL_LAM_THR_LIST[@]} * ${#DUAL_HEAD_LIST[@]} * ${#CAT_LOSS_WEIGHT_LIST[@]} * ${#CAT_TAU_LIST[@]} * ${#CAT_PENALTY_LIST[@]} ))"
+echo "Total number of runs: $(( ${#PROTOCOLS[@]} * ${#RESOLUTIONS[@]} * ${#KS_VIEWS[@]} * ${#TARGET_SCALE_LIST[@]} * ${#TAIL_PENALTY_LIST[@]} * ${#TAIL_LAM_CAP_LIST[@]} * ${#TAIL_LAM_THR_LIST[@]} * ${#DUAL_HEAD_LIST[@]} * ${#CAT_LOSS_WEIGHT_LIST[@]} * ${#CAT_TAU_LIST[@]} * ${#CAT_PENALTY_LIST[@]}))"
 
 for PROTOCOL in "${PROTOCOLS[@]}"; do
 	case "$PROTOCOL" in
@@ -118,8 +132,17 @@ for PROTOCOL in "${PROTOCOLS[@]}"; do
 												run_tag="scale${target_scale}_tail${tail_penalty}_cap${tail_lam_cap}_thr${tail_lam_thr}_dual${dual_head}_w${cat_loss_weight}_tau${cat_tau}_pen${cat_penalty}"
 												run_tag_with_tail_scale="scale${target_scale}_tail${tail_penalty}_cap${tail_lam_cap}_thr${tail_lam_thr}_scale${tail_scale}_dual${dual_head}_w${cat_loss_weight}_tau${cat_tau}_pen${cat_penalty}"
 												extra_flags=()
+												# if [[ "$PROTOCOL" == "lpo" ]]; then
+												# 	NUM_EPOCHS="50"
+												# elif [[ "$PROTOCOL" == "lio" ]]; then
+												# 	NUM_EPOCHS="100"
+												# elif [[ "$PROTOCOL" == "random" ]]; then
+												# 	NUM_EPOCHS="100"
+												# fi
 												if [[ "$CACHE_TRAIN" == "1" ]]; then extra_flags+=(--cache-train); fi
 												if [[ "$CACHE_TEST" == "1" ]]; then extra_flags+=(--cache-test); fi
+													extra_flags+=(--jobs-per-gpu "$JOBS_PER_GPU")
+													extra_flags+=(--val-ratio-lpo "$effective_val_ratio_lpo" --val-ratio-lio "$effective_val_ratio_lio" --val-ratio-random "$effective_val_ratio_random")
 												if [[ -n "$MAX_PARALLEL" ]]; then extra_flags+=(--max-parallel "$MAX_PARALLEL"); fi
 												if [[ -n "$TB_LOG_DIR" ]]; then
 													run_tb_dir="${TB_LOG_DIR}/${run_tag}/${PROTOCOL}"

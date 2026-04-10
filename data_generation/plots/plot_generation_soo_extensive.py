@@ -28,7 +28,7 @@ k_views = 128
 
 ell_min = 0.02
 ell_max = 0.7  
-log_uniform_scale = True
+log_uniform_scale = False
 
 use_processes = True
 n_workers = max(1, mp.cpu_count() - 1)
