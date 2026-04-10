@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Minimal runner for train.py (multi-GPU parallel CV orchestrator).
+# Minimal runner for train_parallel.py (multi-GPU parallel CV orchestrator).
 # Usage examples:
 #   bash train.sh
 #   PROTOCOL=all GPUS=0,1,2,3 MAX_PARALLEL=4 bash train.sh
@@ -15,7 +15,15 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-PYTHON_BIN="${PYTHON_BIN:-/data1/home/jw1017/miniforge3/envs/as_bbo/bin/python}"
+PROJECT_ROOT="${PROJECT_ROOT:-${GEOPAS_PROJECT_ROOT:-$(cd "$ROOT_DIR/.." && pwd)}}"
+RESULTS_ROOT="${RESULTS_ROOT:-$PROJECT_ROOT/results/bbob_by_deepela/results}"
+RELERT_CSV_DEFAULT="$ROOT_DIR/data_generation/performances/relert.csv"
+
+DEFAULT_PYTHON_BIN="/data1/home/jw1017/miniforge3/envs/as_bbo/bin/python"
+PYTHON_BIN="${PYTHON_BIN:-$DEFAULT_PYTHON_BIN}"
+if [[ ! -x "$PYTHON_BIN" && -n "${CONDA_PREFIX:-}" && -x "$CONDA_PREFIX/bin/python" ]]; then
+	PYTHON_BIN="$CONDA_PREFIX/bin/python"
+fi
 if [[ ! -x "$PYTHON_BIN" ]]; then
 	echo "ERROR: PYTHON_BIN not found/executable: $PYTHON_BIN" >&2
 	echo "Set PYTHON_BIN to your as_bbo python, e.g.:" >&2
@@ -27,8 +35,8 @@ ELL_MAX="0.7"
 LOG_UNIFORM_SCALE="true"
 
 PROTOCOLS=("lpo" "lio" "random")                # "lpo", "lio", or "random"
-CSV="/data1/home/jw1017/AS_BBO_REBUILT/data/bbob_by_deepela/relert.csv"      # protocol CSV file
-DATA_ROOT="/data1/home/jw1017/AS_BBO_REBUILT/data/bbob_by_deepela/maxscale_${ELL_MAX}_logscale_${LOG_UNIFORM_SCALE}/"
+CSV="${CSV:-$RELERT_CSV_DEFAULT}"      # protocol CSV file
+DATA_ROOT="${DATA_ROOT:-$PROJECT_ROOT/data/bbob_by_deepela/maxscale_${ELL_MAX}_logscale_${LOG_UNIFORM_SCALE}}"
 # RESOLUTIONS=(8 16 32 64)
 # KS_VIEWS=(1 2 4 8 16 32 64 128)
 RESOLUTIONS=(8)
@@ -55,11 +63,12 @@ N_SPLITS="5"
 GPUS="auto"                 # "auto" or comma-separated GPU indices (e.g. 0,1,2,3)
 JOBS_PER_GPU="1"            # independent jobs allowed to share each selected GPU
 MAX_PARALLEL=""             # empty = default to number of GPUs
-OUT_DIR_BASE="/data1/home/jw1017/AS_BBO_REBUILT/results/bbob_by_deepela/results/bbob"
+OUT_DIR_BASE="${OUT_DIR_BASE:-$RESULTS_ROOT/bbob}"
 SKIP_EXISTING="${SKIP_EXISTING:-0}"   # 1: skip configs whose final results CSV already exists
 
 # TensorBoard logging
-TB_LOG_DIR="/data1/home/jw1017/AS_BBO_REBUILT/results/bbob_by_deepela/results/tensorboard"     # empty string disables TensorBoard logging
+TB_LOG_DIR_DEFAULT="$RESULTS_ROOT/tensorboard"
+TB_LOG_DIR="${TB_LOG_DIR-$TB_LOG_DIR_DEFAULT}"     # empty string disables TensorBoard logging
 TB_LOG_VAL="1"                       # 1: log val/as, 0: disable val/as logging
 
 CACHE_TRAIN="0"              # 1 to cache train samples in RAM per worker
@@ -93,8 +102,10 @@ if [[ "$EARLY_STOPPING_ENABLED" != "1" ]]; then
 	effective_val_ratio_random="0.0"
 fi
 
-echo "Running train.py"
+echo "Running train_parallel.py"
 echo "  python:     $PYTHON_BIN"
+echo "  project_root: $PROJECT_ROOT"
+echo "  results_root: $RESULTS_ROOT"
 echo "  protocols:   $PROTOCOLS"
 echo "  csv:        $CSV"
 echo "  data_root:  $DATA_ROOT" 

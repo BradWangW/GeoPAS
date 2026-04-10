@@ -1,21 +1,21 @@
 name: as_bbo
 channels:
-	- pytorch
-	- nvidia
-	- conda-forge
+  - pytorch
+  - nvidia
+  - conda-forge
 dependencies:
-	- python=3.10
-	- numpy=2.2.*
-	- pandas=2.3.*
-	- scipy=1.15.*
-	- matplotlib=3.10.*
-	- tqdm=4.67.*
-	- pytorch=2.5.*
-	- pytorch-cuda=12.1
-	- tensorboard=2.20.*
-	- ipython=8.37.*
-	- ipykernel=7.1.*
-	- pip
-	- pip:
-			- coco-experiment==2.8.2
-			- cocopp==2.8.2
+  - python=3.10
+  - numpy=2.2.*
+  - pandas=2.3.*
+  - scipy=1.15.*
+  - matplotlib=3.10.*
+  - tqdm=4.67.*
+  - pytorch=2.5.*
+  - pytorch-cuda=12.1
+  - tensorboard=2.20.*
+  - ipython=8.37.*
+  - ipykernel=7.1.*
+  - pip
+  - pip:
+      - coco-experiment==2.8.2
+      - cocopp==2.8.2

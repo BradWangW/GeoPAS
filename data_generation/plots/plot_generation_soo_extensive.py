@@ -5,6 +5,7 @@ import time
 import warnings
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
 from tqdm import tqdm
 
 from auxiliary_functions import process_problem_chunk
@@ -33,7 +34,11 @@ log_uniform_scale = False
 use_processes = True
 n_workers = max(1, mp.cpu_count() - 1)
 
-out_dir = f"/data1/home/jw1017/AS_BBO_REBUILT/data/bbob_by_deepela/maxscale_{ell_max}_logscale_{str(log_uniform_scale).lower()}"
+workspace_root = Path(__file__).resolve().parents[2]
+project_root = Path(
+    os.environ.get("PROJECT_ROOT", os.environ.get("GEOPAS_PROJECT_ROOT", str(workspace_root.parent)))
+).resolve()
+out_dir = project_root / "data" / "bbob_by_deepela" / f"maxscale_{ell_max}_logscale_{str(log_uniform_scale).lower()}"
 
 print(f"Repetitions: {num_repetitions}")
 print(f"Workers: {n_workers} processes")
@@ -56,7 +61,7 @@ for resolution in tqdm(
     total=len(resolutions),
 ):
 
-    out_dir_res = f"{out_dir}/res_{resolution}"
+    out_dir_res = out_dir / f"res_{resolution}"
     # out_dir_res = f"data/bbob_uniform/res_{resolution}"
     os.makedirs(out_dir_res, exist_ok=True)
 
@@ -148,7 +153,7 @@ for resolution in tqdm(
         "timings_group_dim": timing_summary,
     }
 
-    timing_path = os.path.join(out_dir, f"timings_res_{resolution}.json")
+    timing_path = out_dir / f"timings_res_{resolution}.json"
     with open(timing_path, "w") as f:
         json.dump(timing_out, f, indent=2)
 
