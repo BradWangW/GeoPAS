@@ -1,7 +1,7 @@
+# GeoPAS
+
 [![arXiv](https://img.shields.io/badge/arXiv-2604.09095-b31b1b.svg)](https://arxiv.org/abs/2604.09095)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-
-# GeoPAS
 
 GeoPAS is a learning-based framework for automated algorithm selection in continuous black-box optimisation. It predicts, for each problem instance, which solver in a candidate portfolio is most likely to perform best under a fixed probing budget. This repository contains the data generation, training, evaluation, and analysis code used in the accompanying paper *GeoPAS: Geometric Probing for Algorithm Selection in Continuous Black-Box Optimisation*.
 
