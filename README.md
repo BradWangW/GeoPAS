@@ -1,4 +1,4 @@
-# GeoPAS
+# GeoPAS: Geometric Probing for Algorithm Selection in Continuous Black-Box Optimisation
 
 [![arXiv](https://img.shields.io/badge/arXiv-2604.09095-b31b1b.svg)](https://arxiv.org/abs/2604.09095)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
