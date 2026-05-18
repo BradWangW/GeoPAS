@@ -67,7 +67,7 @@ python data_generation/plots/plot_generation_soo_extensive.py
 will write data under:
 
 ```text
-$PROJECT_ROOT/data/bbob_by_deepela/maxscale_0.7_logscale_false/
+$PROJECT_ROOT/data/bbob_by_deepela/maxscale_0.7_logscale_true/
 ```
 
 depending on the setting.
@@ -105,21 +105,6 @@ If results over multiple parameter settings are obtained, use `analyses/concaten
 - `analyses/robustness_over_parameters.ipynb` summarises performance over parameter slices.
 - `analyses/performance_analysis.ipynb` compares relERT transforms and portfolio structure.
 - `analyses/analysis.ipynb` rebuilds the failure-mode analysis from saved outputs.
-
-## Path overrides
-
-The main path overrides used by `train.sh` are:
-
-```bash
-PROJECT_ROOT=/path/to/AS_BBO_REBUILT \
-RESULTS_ROOT=/path/to/results/bbob_by_deepela/results \
-DATA_ROOT=/path/to/generated_npz_root \
-OUT_DIR_BASE=/path/to/results/bbob \
-TB_LOG_DIR=/path/to/results/tensorboard \
-bash train.sh
-```
-
-The notebooks use the same default root resolution and also honor `PROJECT_ROOT` and `RESULTS_ROOT`.
 
 ## Direct training entry point
 
