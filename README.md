@@ -21,11 +21,14 @@ GeoPAS/
 │       ├── plot_generation_soo_extensive.py
 │       ├── plot_check.ipynb
 │       └── AS_BBOB_SOO.code-workspace
+├── analyses/
+│   ├── analysis.ipynb
+│   ├── analysis_utils.py
+│   ├── concatenate_over_parameters.ipynb
+│   ├── performance_analysis.ipynb
+│   └── robustness_over_parameters.ipynb
 ├── train_parallel.py
 ├── train.sh
-├── analysis.ipynb
-├── concatenate_over_parameters.ipynb
-└── robustness_over_budget.ipynb
 ```
 <!-- 
 ## Main files
@@ -95,12 +98,13 @@ including a summary table and a dataframe of model outputs.
 
 ### 4. Aggregate results
 
-If results over multiple parameter settings are obtained, use `concatenate_over_parameters.ipynb` to aggregate them into protocol-wise tables`AS_mean_median_p90__{LPO,LIO,RANDOM}__ALL_RUNS.csv`, and then to `AS_mean_median_p90__MERGED__ALL_RUNS.csv`. 
+If results over multiple parameter settings are obtained, use `analyses/concatenate_over_parameters.ipynb` to aggregate them into protocol-wise tables `AS_mean_median_p90__{LPO,LIO,RANDOM}__ALL_RUNS.csv`, and then into `AS_mean_median_p90__MERGED__ALL_RUNS.csv`.
 
 ### 5. Analyses
 
-- `robustness_over_budget.ipynb` summarises results over resolution and number of views. 
-- `analysis.ipynb`: validation and failure-mode analysis
+- `analyses/robustness_over_parameters.ipynb` summarises performance over parameter slices.
+- `analyses/performance_analysis.ipynb` compares relERT transforms and portfolio structure.
+- `analyses/analysis.ipynb` rebuilds the failure-mode analysis from saved outputs.
 
 ## Path overrides
 
