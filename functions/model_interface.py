@@ -4,7 +4,7 @@ import copy
 import random
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Hashable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -79,6 +79,197 @@ def default_data_dir(root: str, resolution: int) -> str:
     return os.path.join(root, f"res_{resolution}")
 
 
+TARGET_SCALE_CHOICES = {"log", "raw", "norm", "sigmoid_log", "norm_power", "log_norm_power", "log_power"}
+TARGET_SCALES_NEED_BOUNDS = {"norm", "norm_power", "log_norm_power"}
+
+
+def _resolve_target_scale(target_scale: Optional[str], *, fallback: str = "log") -> str:
+    scale = fallback if target_scale is None else str(target_scale).lower().strip()
+    if scale not in TARGET_SCALE_CHOICES:
+        raise ValueError(
+            f"target_scale must be one of {sorted(TARGET_SCALE_CHOICES)}, got: {target_scale!r}"
+        )
+    return scale
+
+
+def _transform_target_np(
+    target: np.ndarray,
+    *,
+    target_scale: str,
+    target_min: Optional[float] = None,
+    target_max: Optional[float] = None,
+    sigmoid_log_s: float = 1.2,
+) -> np.ndarray:
+    target = np.asarray(target, dtype=np.float32)
+    if target_scale == "log":
+        log_target = np.log(np.maximum(target, 1e-6)).astype(np.float32)
+        norm_log_target = log_target / np.max(log_target) 
+        return norm_log_target
+    if target_scale == "log_power":
+        log_target = np.log(np.maximum(target, 1e-6)).astype(np.float32)
+        norm_log_target = log_target / np.max(log_target) 
+        return np.power(norm_log_target, sigmoid_log_s)
+    if target_scale == "sigmoid_log":
+        log_target = np.log(np.maximum(target, 1e-6))
+        s = float(sigmoid_log_s)
+        return (1.0 / (1.0 + np.exp( -(log_target - np.log(14.863))/s ))).astype(np.float32)
+    if target_scale in TARGET_SCALES_NEED_BOUNDS:
+        if target_min is None or target_max is None:
+            raise ValueError(
+                "target_min and target_max are required when target_scale is 'norm', 'norm_power', or 'log_norm_power'"
+            )
+        scale = max(float(target_max) - float(target_min), 1e-6)
+        norm_target = ((target - float(target_min)) / scale).astype(np.float32)
+        if target_scale == "norm_power":
+            return np.power(norm_target, float(sigmoid_log_s)).astype(np.float32)
+        if target_scale == "log_norm_power":
+            log_target = np.log(np.maximum(target, 1e-6)).astype(np.float32)
+            return ((1 - sigmoid_log_s) * log_target / np.max(log_target) + sigmoid_log_s * norm_target).astype(np.float32)
+        return norm_target
+    return target.astype(np.float32)
+
+
+def _transform_target_rows_np(
+    target: np.ndarray,
+    *,
+    target_scale: str,
+    target_min: Optional[float] = None,
+    target_max: Optional[float] = None,
+    sigmoid_log_s: float = 1.2,
+) -> np.ndarray:
+    target = np.asarray(target, dtype=np.float32)
+    if target.ndim <= 1:
+        return _transform_target_np(
+            target,
+            target_scale=target_scale,
+            target_min=target_min,
+            target_max=target_max,
+            sigmoid_log_s=sigmoid_log_s,
+        )
+
+    rows = [
+        _transform_target_np(
+            row,
+            target_scale=target_scale,
+            target_min=target_min,
+            target_max=target_max,
+            sigmoid_log_s=sigmoid_log_s,
+        )
+        for row in target
+    ]
+    if not rows:
+        return np.empty_like(target, dtype=np.float32)
+    return np.stack(rows, axis=0).astype(np.float32, copy=False)
+
+
+def save_target_curve_plot(
+    df: pd.DataFrame,
+    *,
+    out_dir: str,
+    target_scale: str,
+    sigmoid_log_s: float = 1.2,
+    head_2_target_scale: Optional[str] = None,
+    head_2_sigmoid_log_s: Optional[float] = None,
+) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"[target-plot] Skipping target plot because matplotlib is unavailable: {exc}")
+        return
+
+    alg_cols = list(df.columns[2:])
+    raw_values = df.loc[:, alg_cols].to_numpy(dtype=np.float32, copy=False)
+    raw_min = max(float(np.min(raw_values)), 1e-6)
+    raw_max = max(float(np.max(raw_values)), raw_min * 1.01)
+    x_values = np.geomspace(raw_min, raw_max, num=512).astype(np.float32)
+
+    target_scale = _resolve_target_scale(target_scale)
+    target_min = raw_min if target_scale in TARGET_SCALES_NEED_BOUNDS else None
+    target_max = raw_max if target_scale in TARGET_SCALES_NEED_BOUNDS else None
+    y_main = _transform_target_np(
+        x_values,
+        target_scale=target_scale,
+        target_min=target_min,
+        target_max=target_max,
+        sigmoid_log_s=float(sigmoid_log_s),
+    )
+
+    fig, ax = plt.subplots(figsize=(6.8, 4.2))
+    ax.plot(x_values, y_main, linewidth=2.0, label=f"main: {target_scale}")
+
+    ax.plot(x_values, x_values/np.max(x_values), linewidth=1.0, linestyle=":", label="identity")
+    ax.plot(x_values, np.log(np.maximum(x_values, 1e-6))/np.log(np.max(np.maximum(x_values, 1e-6))), linewidth=1.0, linestyle=":", label="log")
+
+    if head_2_target_scale is not None:
+        head_2_target_scale = _resolve_target_scale(head_2_target_scale, fallback=target_scale)
+        head_2_sigmoid_log_s_f = float(head_2_sigmoid_log_s) if head_2_sigmoid_log_s is not None else float(sigmoid_log_s)
+        head_2_target_min = raw_min if head_2_target_scale in TARGET_SCALES_NEED_BOUNDS else None
+        head_2_target_max = raw_max if head_2_target_scale in TARGET_SCALES_NEED_BOUNDS else None
+
+        if not (
+            head_2_target_scale == target_scale
+            and head_2_target_min == target_min
+            and head_2_target_max == target_max
+            and head_2_sigmoid_log_s_f == float(sigmoid_log_s)
+        ):
+            y_head_2 = _transform_target_np(
+                x_values,
+                target_scale=head_2_target_scale,
+                target_min=head_2_target_min,
+                target_max=head_2_target_max,
+                sigmoid_log_s=head_2_sigmoid_log_s_f,
+            )
+            ax.plot(x_values, y_head_2, linewidth=2.0, linestyle="--", label=f"head_2: {head_2_target_scale}")
+
+    ax.set_xscale("log")
+    ax.set_xlabel("raw relERT")
+    ax.set_ylabel("transformed target")
+    ax.set_title("Target Transform Curve")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "target_curve.png"), dpi=200)
+    plt.close(fig)
+
+
+def compute_statistical_prior(
+    df_train: pd.DataFrame,
+    *,
+    alg_cols: Optional[Sequence[str]] = None,
+    prior_scale: str = "sigmoid_log",
+    sigmoid_log_s: float = 1.2,
+) -> np.ndarray:
+    alg_cols = list(df_train.columns[2:] if alg_cols is None else alg_cols)
+    target = df_train.loc[:, alg_cols].to_numpy(dtype=np.float32, copy=False)
+    if target.size == 0:
+        return np.zeros(len(alg_cols), dtype=np.float64)
+
+    prior_scale = _resolve_target_scale(prior_scale)
+    target_min: Optional[float] = None
+    target_max: Optional[float] = None
+    if prior_scale in TARGET_SCALES_NEED_BOUNDS:
+        target_min = float(np.min(target))
+        target_max = float(np.max(target))
+
+    transformed = _transform_target_rows_np(
+        target,
+        target_scale=prior_scale,
+        target_min=target_min,
+        target_max=target_max,
+        sigmoid_log_s=float(sigmoid_log_s),
+    )
+    prior = np.asarray(np.mean(transformed, axis=0, dtype=np.float64), dtype=np.float64)
+    print(
+        f"Statistical prior ({prior_scale}):\n"
+        f"{pd.Series(prior, index=alg_cols).round(3)}",
+        flush=True,
+    )
+    return prior
+
+
 # ----------------------------- dataset ------------------------------------ #
 
 @dataclass(frozen=True)
@@ -99,7 +290,8 @@ class MultiViewNPZDataset(Dataset):
       plots  (K,r,r) float32
       masks  (K,r,r) float32 in {0,1}
             stats  (K,3)   float32
-      target (M,)    float32  (algorithm performance vector)
+            target (M,)    float32  (main-head algorithm performance vector)
+            head_2_target (M,) float32  (second-head algorithm performance vector)
     """
 
     def __init__(
@@ -113,7 +305,13 @@ class MultiViewNPZDataset(Dataset):
         strict: bool = True,
         k_views: int = 32,
         target_scale: str = "log",
-        catastrophe_log_threshold: float = np.log(36690),
+        target_min: Optional[float] = None,
+        target_max: Optional[float] = None,
+        sigmoid_log_s: float = 1.2,
+        head_2_target_scale: Optional[str] = None,
+        head_2_target_min: Optional[float] = None,
+        head_2_target_max: Optional[float] = None,
+        head_2_sigmoid_log_s: Optional[float] = None,
     ):
         # Keep a private copy to avoid mutating caller data.
         # (Important: evaluation expects relERT >= 1; training may use log-targets.)
@@ -124,20 +322,36 @@ class MultiViewNPZDataset(Dataset):
         self.cache = bool(cache)
         self.strict = bool(strict)
         self.k_views = int(k_views)
-        self.target_scale = str(target_scale).lower().strip()
-        self.catastrophe_log_threshold = float(catastrophe_log_threshold)
-
-        if self.target_scale not in {"log", "raw"}:
-            raise ValueError(f"target_scale must be 'log' or 'raw', got: {target_scale!r}")
+        self.target_scale = _resolve_target_scale(target_scale)
+        self.head_2_target_scale = _resolve_target_scale(head_2_target_scale, fallback=self.target_scale)
 
         # targets are all columns after Problem, Dim
         self.alg_cols = list(self.df.columns[2:])
+        self.target_min = float(target_min) if target_min is not None else None
+        self.target_max = float(target_max) if target_max is not None else None
+        self.sigmoid_log_s = float(sigmoid_log_s)
+        if self.target_scale in TARGET_SCALES_NEED_BOUNDS and (self.target_min is None or self.target_max is None):
+            target_values = self.df.loc[:, self.alg_cols].to_numpy(dtype=np.float32, copy=False)
+            self.target_min = float(np.min(target_values))
+            self.target_max = float(np.max(target_values))
+
+        self.head_2_target_min = float(head_2_target_min) if head_2_target_min is not None else None
+        self.head_2_target_max = float(head_2_target_max) if head_2_target_max is not None else None
+        self.head_2_sigmoid_log_s = (
+            float(head_2_sigmoid_log_s) if head_2_sigmoid_log_s is not None else self.sigmoid_log_s
+        )
+        if self.head_2_target_scale in TARGET_SCALES_NEED_BOUNDS and (
+            self.head_2_target_min is None or self.head_2_target_max is None
+        ):
+            target_values = self.df.loc[:, self.alg_cols].to_numpy(dtype=np.float32, copy=False)
+            self.head_2_target_min = float(np.min(target_values))
+            self.head_2_target_max = float(np.max(target_values))
 
         # Build index: one file per (row in df) × instance × repetition
         self.files: List[str] = []
         self.meta: List[SampleMeta] = []
         self.targets: List[torch.Tensor] = []
-        self.cat_labels: List[torch.Tensor] = []
+        self.head_2_targets: List[torch.Tensor] = []
 
         # Optional in-memory cache
         self._cache_plots: List[torch.Tensor] = []
@@ -145,24 +359,35 @@ class MultiViewNPZDataset(Dataset):
         self._cache_stats: List[torch.Tensor] = []
         self._cache_dims: List[int] = []
 
-        def target_transform_np(x: np.ndarray) -> np.ndarray:
-            x = np.asarray(x, dtype=np.float32)
-            if self.target_scale == "log":
-                return np.log(np.maximum(x, 1e-6)).astype(np.float32)
-            # raw scale
-            return x.astype(np.float32)
-
         for row in range(len(self.df)):
             fid = problem_to_fid(self.df.loc[row, "Problem"])
             dim = int(self.df.loc[row, "Dim"])
 
             target_raw = self.df.loc[row, self.alg_cols].astype(np.float32).to_numpy()
-            target_np = target_transform_np(target_raw)
+            target_np = _transform_target_np(
+                target_raw,
+                target_scale=self.target_scale,
+                target_min=self.target_min,
+                target_max=self.target_max,
+                sigmoid_log_s=self.sigmoid_log_s,
+            )
             target = torch.from_numpy(target_np)
-            # Catastrophe labels are defined in log(relERT) space for consistency across target scales.
-            target_log = np.log(np.maximum(target_raw, 1e-6)).astype(np.float32)
-            cat_np = (target_log >= self.catastrophe_log_threshold).astype(np.float32)
-            cat = torch.from_numpy(cat_np)
+            if (
+                self.head_2_target_scale == self.target_scale
+                and self.head_2_target_min == self.target_min
+                and self.head_2_target_max == self.target_max
+                and self.head_2_sigmoid_log_s == self.sigmoid_log_s
+            ):
+                head_2_target = target
+            else:
+                head_2_target_np = _transform_target_np(
+                    target_raw,
+                    target_scale=self.head_2_target_scale,
+                    target_min=self.head_2_target_min,
+                    target_max=self.head_2_target_max,
+                    sigmoid_log_s=self.head_2_sigmoid_log_s,
+                )
+                head_2_target = torch.from_numpy(head_2_target_np)
 
             for inst in self.instances:
                 for rep in range(self.num_repetitions):
@@ -178,7 +403,7 @@ class MultiViewNPZDataset(Dataset):
                     self.files.append(path)
                     self.meta.append(SampleMeta(fid=fid, dim=dim, instance=inst, rep=rep))
                     self.targets.append(target)
-                    self.cat_labels.append(cat)
+                    self.head_2_targets.append(head_2_target)
 
                     if self.cache:
                         arr = np.load(path)
@@ -216,8 +441,8 @@ class MultiViewNPZDataset(Dataset):
             dim = self.meta[idx].dim
 
         target = self.targets[idx]
-        cat = self.cat_labels[idx]
-        return plots, masks, stats, dim, target, cat
+        head_2_target = self.head_2_targets[idx]
+        return plots, masks, stats, dim, target, head_2_target
 
     @property
     def problem_ids(self) -> List[str]:
@@ -253,54 +478,37 @@ class SubsetMultiViewNPZDataset(Dataset):
         if len(self.indices) == 0:
             raise ValueError("Subset indices must be non-empty")
 
-        self._cache_plots: List[torch.Tensor] = []
-        self._cache_masks: List[torch.Tensor] = []
-        self._cache_stats: List[torch.Tensor] = []
-        self._cache_dims: List[int] = []
-        self._cache_targets: List[torch.Tensor] = []
-        self._cache_cat: List[torch.Tensor] = []
-
         if self.cache:
-            for base_idx in self.indices:
-                plots, masks, stats, dim, target, cat = self.base[base_idx]
-                self._cache_plots.append(plots)
-                self._cache_masks.append(masks)
-                self._cache_stats.append(stats)
-                self._cache_dims.append(int(dim))
-                self._cache_targets.append(target)
-                self._cache_cat.append(cat)
+            self._cache_items = [self.base[base_idx] for base_idx in self.indices]
+        else:
+            self._cache_items = []
 
     def __len__(self) -> int:
         return len(self.indices)
 
     def __getitem__(self, idx: int):
         if self.cache:
-            return (
-                self._cache_plots[idx],
-                self._cache_masks[idx],
-                self._cache_stats[idx],
-                self._cache_dims[idx],
-                self._cache_targets[idx],
-                self._cache_cat[idx],
-            )
-        base_idx = self.indices[idx]
-        return self.base[base_idx]
+            return self._cache_items[idx]
+        return self.base[self.indices[idx]]
+
+    def _meta_values(self, field: str) -> List[int]:
+        return [int(getattr(self.base.meta[i], field)) for i in self.indices]
 
     @property
     def problem_ids(self) -> List[str]:
-        return [f"f{self.base.meta[i].fid}" for i in self.indices]
+        return [f"f{fid}" for fid in self._meta_values("fid")]
 
     @property
     def dims(self) -> List[int]:
-        return [int(self.base.meta[i].dim) for i in self.indices]
+        return self._meta_values("dim")
 
     @property
     def instance_ids(self) -> List[int]:
-        return [int(self.base.meta[i].instance) for i in self.indices]
+        return self._meta_values("instance")
 
     @property
     def repetitions(self) -> List[int]:
-        return [int(self.base.meta[i].rep) for i in self.indices]
+        return self._meta_values("rep")
 
 
 # -------------------------- training / evaluation -------------------------- #
@@ -383,62 +591,16 @@ def percentile_weighted_loss(pred, target):
     return (weights * diff).mean()
 
 
-def _cat_accuracy_table(
+def _blend_dual_head_outputs(
+    main_output: torch.Tensor,
+    head_2_output: Optional[torch.Tensor],
     *,
-    problem_ids: Sequence[str],
-    dims: Sequence[int],
-    cat_prob: np.ndarray,
-    cat_true: np.ndarray,
-    cat_tau: float,
-) -> pd.DataFrame:
-    """Elementwise catastrophe recognition accuracy per BBOB-group × dimension.
-
-    Computes accuracy over all (sample, algorithm) elements in each subset.
-    """
-    problem_ids_s = pd.Series(problem_ids, dtype=str).str.lower()
-    dims_arr = np.asarray(dims, dtype=int)
-    cat_prob = np.asarray(cat_prob, dtype=float)
-    cat_true = np.asarray(cat_true, dtype=float)
-    if cat_prob.shape != cat_true.shape:
-        raise ValueError(f"cat_prob/cat_true shape mismatch: {cat_prob.shape} vs {cat_true.shape}")
-    if len(problem_ids_s) != cat_prob.shape[0] or len(dims_arr) != cat_prob.shape[0]:
-        raise ValueError("problem_ids/dims must align with cat arrays")
-
-    group_defs = [
-        ("f1-f5", 1, 5),
-        ("f6-f9", 6, 9),
-        ("f10-f14", 10, 14),
-        ("f15-f19", 15, 19),
-        ("f20-f24", 20, 24),
-    ]
-    group_names = [g for (g, _, _) in group_defs] + ["all"]
-
-    fid = problem_ids_s.str.extract(r"(\d+)", expand=False).astype(int).to_numpy()
-    group = np.full(fid.shape, "all", dtype=object)
-    for name, lo, hi in group_defs:
-        group[(fid >= lo) & (fid <= hi)] = name
-
-    dims_list = sorted(pd.unique(dims_arr))
-    all_dims: List[object] = list(dims_list) + ["all"]
-
-    cat_pred = (cat_prob >= float(cat_tau))
-    cat_true_b = (cat_true >= 0.5)
-    # Use NaN for subsets with no samples so fold-averaging does not dilute values
-    # (important for LPO where each fold covers only one problem group).
-    acc = np.full((len(all_dims), len(group_names)), np.nan, dtype=float)
-
-    for di, dval in enumerate(all_dims):
-        dim_mask = np.ones(len(dims_arr), dtype=bool) if dval == "all" else (dims_arr == int(dval))
-        for gi, gname in enumerate(group_names):
-            grp_mask = np.ones(len(dims_arr), dtype=bool) if gname == "all" else (group == gname)
-            m = dim_mask & grp_mask
-            if not np.any(m):
-                continue
-            acc[di, gi] = float(np.mean(cat_pred[m] == cat_true_b[m]))
-
-    df = pd.DataFrame(acc, columns=group_names)
-    df.insert(0, "Dim", all_dims)
-    return df
+    head_2_weight: float,
+) -> torch.Tensor:
+    if head_2_output is None:
+        return main_output
+    weight = float(head_2_weight)
+    return (1.0 - weight) * main_output + weight * head_2_output
 
 
 def single_train(
@@ -454,10 +616,8 @@ def single_train(
     tb_log_dir: Optional[str] = None,
     tb_run_name: Optional[str] = None,
     tb_log_val: bool = False,
-    cat_loss_weight: float = 15.0,
-    cat_tau: float = 0.5,
-    cat_penalty: float = 15,
-    return_cat_arrays: bool = False,
+    head_2_loss_weight: float = 0.5,
+    head_2_score_weight: float = 0.5,
     return_history: bool = False,
     val_ratio: float = 0.0,
     early_stopping_patience: int = 15,
@@ -470,8 +630,8 @@ def single_train(
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optim, gamma=lr_decay_gamma)
 
     reg_loss_fn = nn.SmoothL1Loss()
-    # reg_loss_fn = nn.SmoothL1Loss(beta=12.477)
-    cat_loss_fn = nn.BCEWithLogitsLoss()
+    head_2_loss_weight_f = float(head_2_loss_weight)
+    head_2_score_weight_f = float(head_2_score_weight)
 
     base_loader_seed = int(torch.initial_seed()) & 0xFFFFFFFF
 
@@ -511,9 +671,9 @@ def single_train(
         out = model(plots, masks, stats, dim)
         if isinstance(out, (tuple, list)):
             if len(out) != 2:
-                raise ValueError(f"Model must return (pred, cat_logits|None), got {type(out)} of len {len(out)}")
-            pred, cat_logits = out
-            return pred, cat_logits
+                raise ValueError(f"Model must return (pred, head_2_pred|None), got {type(out)} of len {len(out)}")
+            pred, head_2_pred = out
+            return pred, head_2_pred
         return out, None
 
     writer = None
@@ -534,13 +694,13 @@ def single_train(
 
         history: Dict[str, List[float]] = {
             "train/loss": [],
-            "train/loss_reg": [],
-            "train/loss_cat": [],
+            "train/loss_main": [],
+            "train/loss_head_2": [],
             "train/as": [],
             "train/lr": [],
             "val/loss": [],
-            "val/loss_reg": [],
-            "val/loss_cat": [],
+            "val/loss_main": [],
+            "val/loss_head_2": [],
             "val/as": [],
         }
 
@@ -550,132 +710,138 @@ def single_train(
 
         for epoch in pbar:
             epoch_losses = []
-            epoch_reg_losses = []
-            epoch_cat_losses = []
+            epoch_main_losses = []
+            epoch_head_2_losses = []
             epoch_train_as_total = 0.0
             epoch_train_as_count = 0
-            for step, (plots, masks, stats, dim, target, cat) in enumerate(train_es_loader):
+            for step, (plots, masks, stats, dim, target, head_2_target) in enumerate(train_es_loader):
                 plots = plots.to(device, non_blocking=True)
                 masks = masks.to(device, non_blocking=True)
                 stats = stats.to(device, non_blocking=True)
                 dim = dim.to(device, non_blocking=True)
                 target = target.to(device, non_blocking=True)
-                cat = cat.to(device, non_blocking=True)
+                head_2_target = head_2_target.to(device, non_blocking=True)
                 
                 optim.zero_grad(set_to_none=True)
-                pred, cat_logits = _forward(plots, masks, stats, dim)
+                pred, head_2_pred = _forward(plots, masks, stats, dim)
 
-                loss_reg = reg_loss_fn(pred, target)
-                use_cat = (cat_logits is not None) and (cat_loss_weight != 0.0)
-                loss_cat = cat_loss_fn(cat_logits, cat) if use_cat else pred.new_zeros(())
-                loss = loss_reg + float(cat_loss_weight) * loss_cat
-
-                if cat_logits is not None:
-                    cat_prob = torch.sigmoid(cat_logits)
-                    unsafe = cat_prob >= float(cat_tau)
-                    train_scores = pred + float(cat_penalty) * unsafe.to(dtype=pred.dtype)
+                loss_main = reg_loss_fn(pred, target)
+                if head_2_pred is None:
+                    loss_head_2 = pred.new_zeros(())
+                    loss = loss_main
                 else:
-                    train_scores = pred
+                    loss_head_2 = reg_loss_fn(head_2_pred, head_2_target)
+                    loss = (1.0 - head_2_loss_weight_f) * loss_main + head_2_loss_weight_f * loss_head_2
+
+                train_scores = _blend_dual_head_outputs(
+                    pred,
+                    head_2_pred,
+                    head_2_weight=head_2_score_weight_f,
+                )
+                train_targets = _blend_dual_head_outputs(
+                    target,
+                    head_2_target if head_2_pred is not None else None,
+                    head_2_weight=head_2_score_weight_f,
+                )
                 train_pick = torch.argmin(train_scores, dim=1)
-                train_achieved = target.gather(1, train_pick.unsqueeze(1)).squeeze(1)
+                train_achieved = train_targets.gather(1, train_pick.unsqueeze(1)).squeeze(1)
                 epoch_train_as_total += float(train_achieved.sum().item())
                 epoch_train_as_count += int(train_achieved.numel())
-                # loss = reg_loss_fn(pred, target) + 2 * _pairwise_logistic_ranking_loss(
-                #     pred, target
-                # )
-                # loss = asymmetric_mse(pred, target, alpha=10.0)
-                # loss = percentile_weighted_loss(pred, target)
                 
                 loss.backward()
                 optim.step()
 
                 epoch_losses.append(loss.item())
-                epoch_reg_losses.append(float(loss_reg.detach().item()))
-                epoch_cat_losses.append(float(cat_loss_weight) * float(loss_cat.detach().item()))
+                epoch_main_losses.append(float(loss_main.detach().item()))
+                epoch_head_2_losses.append(float(loss_head_2.detach().item()))
 
             # Validation score for early stopping (mean objective, lower is better).
             val_score: Optional[float] = None
             val_loss: Optional[float] = None
-            val_loss_reg: Optional[float] = None
-            val_loss_cat: Optional[float] = None
+            val_loss_main: Optional[float] = None
+            val_loss_head_2: Optional[float] = None
             if val_loader is not None:
                 model.eval()
                 total = 0
                 total_as = 0.0
                 total_val_loss = 0.0
-                total_val_loss_reg = 0.0
-                total_val_loss_cat = 0.0
+                total_val_loss_main = 0.0
+                total_val_loss_head_2 = 0.0
                 with torch.no_grad():
-                    for plots, masks, stats, dim, target, cat in val_loader:
+                    for plots, masks, stats, dim, target, head_2_target in val_loader:
                         plots = plots.to(device, non_blocking=True)
                         masks = masks.to(device, non_blocking=True)
                         stats = stats.to(device, non_blocking=True)
                         dim = dim.to(device, non_blocking=True)
                         target = target.to(device, non_blocking=True)
-                        cat = cat.to(device, non_blocking=True)
-                        pred, cat_logits = _forward(plots, masks, stats, dim)
+                        head_2_target = head_2_target.to(device, non_blocking=True)
+                        pred, head_2_pred = _forward(plots, masks, stats, dim)
 
-                        v_loss_reg = reg_loss_fn(pred, target)
-                        v_use_cat = (cat_logits is not None) and (cat_loss_weight != 0.0)
-                        v_loss_cat = cat_loss_fn(cat_logits, cat) if v_use_cat else pred.new_zeros(())
-                        v_loss = v_loss_reg + float(cat_loss_weight) * v_loss_cat
-
-                        # Downstream validation mean AS (lower is better):
-                        # pick algorithm with the lowest predicted (penalized) score, then
-                        # evaluate by the achieved true target value.
-                        if cat_logits is not None:
-                            cat_prob = torch.sigmoid(cat_logits)
-                            unsafe = cat_prob >= float(cat_tau)
-                            scores = pred + float(cat_penalty) * unsafe.to(dtype=pred.dtype)
+                        v_loss_main = reg_loss_fn(pred, target)
+                        if head_2_pred is None:
+                            v_loss_head_2 = pred.new_zeros(())
+                            v_loss = v_loss_main
                         else:
-                            scores = pred
+                            v_loss_head_2 = reg_loss_fn(head_2_pred, head_2_target)
+                            v_loss = (1.0 - head_2_loss_weight_f) * v_loss_main + head_2_loss_weight_f * v_loss_head_2
+
+                        scores = _blend_dual_head_outputs(
+                            pred,
+                            head_2_pred,
+                            head_2_weight=head_2_score_weight_f,
+                        )
+                        score_targets = _blend_dual_head_outputs(
+                            target,
+                            head_2_target if head_2_pred is not None else None,
+                            head_2_weight=head_2_score_weight_f,
+                        )
 
                         pick = torch.argmin(scores, dim=1)  # (B,)
-                        achieved = target.gather(1, pick.unsqueeze(1)).squeeze(1)  # (B,)
+                        achieved = score_targets.gather(1, pick.unsqueeze(1)).squeeze(1)  # (B,)
                         bs = int(achieved.numel())
                         total_as += float(achieved.sum().item())
                         total_val_loss += float(v_loss.item()) * bs
-                        total_val_loss_reg += float(v_loss_reg.item()) * bs
-                        total_val_loss_cat += (float(cat_loss_weight) * float(v_loss_cat.item())) * bs
+                        total_val_loss_main += float(v_loss_main.item()) * bs
+                        total_val_loss_head_2 += float(v_loss_head_2.item()) * bs
                         total += bs
 
                 if total > 0:
                     val_score = float(total_as / total)
                     val_loss = float(total_val_loss / total)
-                    val_loss_reg = float(total_val_loss_reg / total)
-                    val_loss_cat = float(total_val_loss_cat / total)
+                    val_loss_main = float(total_val_loss_main / total)
+                    val_loss_head_2 = float(total_val_loss_head_2 / total)
                     if writer is not None and tb_log_val:
                         writer.add_scalar("val/as", val_score, epoch)
                         writer.add_scalar("val/loss", val_loss, epoch)
-                        writer.add_scalar("val/loss_reg", val_loss_reg, epoch)
-                        writer.add_scalar("val/loss_cat", val_loss_cat, epoch)
+                        writer.add_scalar("val/loss_main", val_loss_main, epoch)
+                        writer.add_scalar("val/loss_head_2", val_loss_head_2, epoch)
                 model.train()
 
             # update the epoch progress bar
             if epoch_losses:
                 avg_loss = float(sum(epoch_losses) / len(epoch_losses))
-                avg_reg = float(sum(epoch_reg_losses) / len(epoch_reg_losses)) if epoch_reg_losses else 0.0
-                avg_cat = float(sum(epoch_cat_losses) / len(epoch_cat_losses)) if epoch_cat_losses else 0.0
+                avg_main = float(sum(epoch_main_losses) / len(epoch_main_losses)) if epoch_main_losses else 0.0
+                avg_head_2 = float(sum(epoch_head_2_losses) / len(epoch_head_2_losses)) if epoch_head_2_losses else 0.0
                 train_as = float(epoch_train_as_total / epoch_train_as_count) if epoch_train_as_count > 0 else float("nan")
                 if val_score is None:
-                    pbar.set_postfix(reg=f"{avg_reg:.6f}", cat=f"{avg_cat:.6f}", train_as=f"{train_as:.6f}")
+                    pbar.set_postfix(main=f"{avg_main:.6f}", h2=f"{avg_head_2:.6f}", train_as=f"{train_as:.6f}")
                 else:
-                    pbar.set_postfix(reg=f"{avg_reg:.6f}", cat=f"{avg_cat:.6f}", train_as=f"{train_as:.6f}", val=f"{val_score:.6f}")
+                    pbar.set_postfix(main=f"{avg_main:.6f}", h2=f"{avg_head_2:.6f}", train_as=f"{train_as:.6f}", val=f"{val_score:.6f}")
                 if writer is not None:
                     writer.add_scalar("train/loss", avg_loss, epoch)
-                    writer.add_scalar("train/loss_reg", avg_reg, epoch)
-                    writer.add_scalar("train/loss_cat", avg_cat, epoch)
+                    writer.add_scalar("train/loss_main", avg_main, epoch)
+                    writer.add_scalar("train/loss_head_2", avg_head_2, epoch)
                     writer.add_scalar("train/as", train_as, epoch)
                     writer.add_scalar("train/lr", float(optim.param_groups[0]["lr"]), epoch)
 
                 history["train/loss"].append(float(avg_loss))
-                history["train/loss_reg"].append(float(avg_reg))
-                history["train/loss_cat"].append(float(avg_cat))
+                history["train/loss_main"].append(float(avg_main))
+                history["train/loss_head_2"].append(float(avg_head_2))
                 history["train/as"].append(float(train_as))
                 history["train/lr"].append(float(optim.param_groups[0]["lr"]))
                 history["val/loss"].append(float(val_loss) if val_loss is not None else float("nan"))
-                history["val/loss_reg"].append(float(val_loss_reg) if val_loss_reg is not None else float("nan"))
-                history["val/loss_cat"].append(float(val_loss_cat) if val_loss_cat is not None else float("nan"))
+                history["val/loss_main"].append(float(val_loss_main) if val_loss_main is not None else float("nan"))
+                history["val/loss_head_2"].append(float(val_loss_head_2) if val_loss_head_2 is not None else float("nan"))
                 history["val/as"].append(float(val_score) if val_score is not None else float("nan"))
 
                 scheduler.step()
@@ -701,120 +867,107 @@ def single_train(
     # evaluate
     model.eval()
     preds_all = []
-    cat_true_all = []
-    cat_prob_all = []
     with torch.no_grad():
-        for plots, masks, stats, dim, _, cat in test_loader:
+        for plots, masks, stats, dim, _, _ in test_loader:
             plots = plots.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
             stats = stats.to(device, non_blocking=True)
             dim   = dim.to(device, non_blocking=True)
-            cat = cat.to(device, non_blocking=True)
 
-            pred, cat_logits = _forward(plots, masks, stats, dim)
-            if cat_logits is not None:
-                cat_prob = torch.sigmoid(cat_logits)
-                unsafe = cat_prob >= float(cat_tau)
-                scores = pred + float(cat_penalty) * unsafe.to(dtype=pred.dtype)
-                cat_true_all.append(cat.detach().cpu())
-                cat_prob_all.append(cat_prob.detach().cpu())
-            else:
-                scores = pred
+            pred, head_2_pred = _forward(plots, masks, stats, dim)
+            scores = _blend_dual_head_outputs(
+                pred,
+                head_2_pred,
+                head_2_weight=head_2_score_weight_f,
+            )
             preds_all.append(scores.detach().cpu().numpy())
 
-    # Catastrophe head metrics (elementwise across algorithms)
-    if cat_true_all and cat_prob_all:
-        cat_true_np = torch.cat(cat_true_all, dim=0).numpy()
-        cat_prob_np = torch.cat(cat_prob_all, dim=0).numpy()
-        # cat_pred_np = (cat_prob_np >= float(cat_tau)).astype(np.float32)
-
-        # cat_acc = float(np.mean(cat_pred_np == cat_true_np))
-        # tp = float(np.sum((cat_pred_np == 1.0) & (cat_true_np == 1.0)))
-        # fp = float(np.sum((cat_pred_np == 1.0) & (cat_true_np == 0.0)))
-        # fn = float(np.sum((cat_pred_np == 0.0) & (cat_true_np == 1.0)))
-        # cat_prec = 0.0 if (tp + fp) <= 0.0 else tp / (tp + fp)
-        # cat_rec = 0.0 if (tp + fn) <= 0.0 else tp / (tp + fn)
-        # cat_f1 = 0.0 if (cat_prec + cat_rec) <= 0.0 else (2.0 * cat_prec * cat_rec) / (cat_prec + cat_rec)
-        # true_rate = float(np.mean(cat_true_np))
-        # pred_rate = float(np.mean(cat_pred_np))
-
-        # print(
-        #     f"[cat eval @tau={float(cat_tau):.3f}] acc={cat_acc:.4f} prec={cat_prec:.4f} rec={cat_rec:.4f} f1={cat_f1:.4f} "
-        #     f"pos_rate_true={true_rate:.4f} pos_rate_pred={pred_rate:.4f}",
-        #     flush=True,
-        # )
-
-        if return_cat_arrays:
-            if return_history:
-                return (
-                    np.concatenate(preds_all, axis=0),
-                    cat_prob_np,
-                    cat_true_np,
-                    history,
-                )
-            return (
-                np.concatenate(preds_all, axis=0),
-                cat_prob_np,
-                cat_true_np,
-            )
-
-    if return_cat_arrays:
-        # Fallback: should not happen in normal runs, but keep return shape stable.
-        empty = np.zeros((0, 0), dtype=np.float32)
-        if return_history:
-            return (np.concatenate(preds_all, axis=0), empty, empty, history)
-        return (np.concatenate(preds_all, axis=0), empty, empty)
+    preds = np.concatenate(preds_all, axis=0)
 
     if return_history:
-        return np.concatenate(preds_all, axis=0), history
+        return preds, history
 
-    return np.concatenate(preds_all, axis=0)
-
-
-def tail_table(df_perf, cap=36690, T_list=(12.477,100,300), tol=1e-3):
-    alg_cols = list(df_perf.columns[2:])
-    rows = {}
-    for alg in alg_cols:
-        v = df_perf[alg].to_numpy()
-        hit_cap = (np.abs(v - cap) <= tol*cap).mean()
-        row = {"P(hit_cap)": hit_cap}
-        for T in T_list:
-            row[f"P(relERT>{T})"] = (v > T).mean()
-        rows[alg] = row
-    df = pd.DataFrame.from_dict(rows, orient="index")
-    return df
+    return preds
 
 
-def compute_risk_penalty(
-    df_tail: pd.DataFrame,
+def _prediction_frame_from_scores(
     *,
-    cap_col: str = "P(hit_cap)",
-    thr_col: Optional[str] = "P(relERT>12.477)",
-    lam_cap: float = 1.0,
-    lam_thr: float = 1.0,
-) -> np.ndarray:
-    """
-    Returns penalty vector p[a] aligned to alg_cols.
-    """
-    alg_cols = list(df_tail.index)
-    missing = [a for a in alg_cols if a not in df_tail.index]
-    if missing:
-        raise KeyError(f"df_tail missing algorithms: {missing}")
-
-    if cap_col not in df_tail.columns:
-        raise KeyError(f"df_tail missing column {cap_col!r}")
-    if thr_col is not None and thr_col not in df_tail.columns:
-        raise KeyError(f"df_tail missing column {thr_col!r}")
-
-    p_cap = df_tail.loc[list(alg_cols), cap_col].to_numpy(dtype=np.float64)
-    p_thr = np.zeros_like(p_cap)
-    if thr_col is not None:
-        p_thr = df_tail.loc[list(alg_cols), thr_col].to_numpy(dtype=np.float64)
-
-    return lam_cap * p_cap + lam_thr * p_thr
+    scores: np.ndarray,
+    test_ds: Any,
+    alg_cols: Sequence[str],
+    attrs: Optional[Mapping[Hashable | None, Any]] = None,
+) -> pd.DataFrame:
+    out = pd.DataFrame(np.asarray(scores), columns=list(alg_cols))
+    out.insert(0, "Repetition", test_ds.repetitions)
+    out.insert(0, "Instance", test_ds.instance_ids)
+    out.insert(0, "Dim", test_ds.dims)
+    out.insert(0, "Problem", test_ds.problem_ids)
+    out.attrs.update(dict(attrs or {}))
+    return out
 
 
-def _train_predict_from_datasets(
+def _print_score_examples(
+    *,
+    base_scores: np.ndarray,
+    final_scores: np.ndarray,
+    prior: Optional[np.ndarray],
+    lam_prior: float,
+) -> None:
+    if prior is None:
+        print("Pred examples:")
+        for i in range(min(5, final_scores.shape[0])):
+            pred_row = np.array2string(final_scores[i], precision=3, suppress_small=True)
+            print(f"  Pred: {pred_row}", flush=True)
+        return
+
+    print("Base score and prior examples:")
+    prior_row = np.array2string(prior, precision=3, suppress_small=True)
+    for i in range(min(5, final_scores.shape[0])):
+        base_row = np.array2string(base_scores[i], precision=3, suppress_small=True)
+        score_row = np.array2string(final_scores[i], precision=3, suppress_small=True)
+        print(
+            f"  Base: {base_row} | Prior: {prior_row} | lam_prior={lam_prior:g} => Score: {score_row}",
+            flush=True,
+        )
+
+
+def materialize_prediction_frame(
+    base_scores: pd.DataFrame,
+    *,
+    alg_cols: Optional[Sequence[str]] = None,
+    prior: Optional[np.ndarray] = None,
+    lam_prior: float = 0.0,
+    tail_scale: float = 1.0,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    alg_cols = list(base_scores.columns[4:] if alg_cols is None else alg_cols)
+    meta_cols = [col for col in ("Problem", "Dim", "Instance", "Repetition") if col in base_scores.columns]
+    meta = base_scores.loc[:, meta_cols].copy()
+    base_values = base_scores.loc[:, alg_cols].to_numpy(dtype=np.float64, copy=True)
+    final_scores = base_values
+    scaled_prior: Optional[np.ndarray] = None
+
+    if prior is not None:
+        scaled_prior = float(tail_scale) * np.asarray(prior, dtype=np.float64)
+        final_scores = (1.0 - float(lam_prior)) * base_values + float(lam_prior) * scaled_prior[None, :]
+
+    if verbose:
+        _print_score_examples(
+            base_scores=base_values,
+            final_scores=final_scores,
+            prior=scaled_prior,
+            lam_prior=float(lam_prior),
+        )
+
+    out = pd.concat(
+        [meta, pd.DataFrame(final_scores, columns=alg_cols, index=meta.index)],
+        axis=1,
+    )
+    out.attrs.update(dict(getattr(base_scores, "attrs", {})))
+    return out
+
+
+def _train_base_scores_from_datasets(
     *,
     train_ds: Dataset,
     test_ds: Dataset,
@@ -833,10 +986,8 @@ def _train_predict_from_datasets(
     tb_log_val: bool,
     val_ratio: float,
     early_stopping_patience: int,
-    cat_loss_weight: float = 15.0,
-    cat_tau: float = 0.5,
-    cat_penalty: float = 15.0,
-    penalty: Optional[np.ndarray] = None,
+    head_2_loss_weight: float = 0.5,
+    head_2_score_weight: float = 0.5,
 ) -> pd.DataFrame:
     train_loader = make_dataloader(
         train_ds,
@@ -858,7 +1009,7 @@ def _train_predict_from_datasets(
     )
 
     model = make_model()
-    preds, cat_prob_np, cat_true_np, tb_history = single_train(
+    preds, tb_history = single_train(
         model,
         train_loader,
         test_loader,
@@ -871,40 +1022,77 @@ def _train_predict_from_datasets(
         tb_run_name=tb_run_name,
         tb_log_val=tb_log_val,
         val_ratio=float(val_ratio),
-        cat_loss_weight=float(cat_loss_weight),
-        cat_tau=float(cat_tau),
-        cat_penalty=float(cat_penalty),
-        return_cat_arrays=True,
+        head_2_loss_weight=float(head_2_loss_weight),
+        head_2_score_weight=float(head_2_score_weight),
         return_history=True,
         early_stopping_patience=int(early_stopping_patience),
     )
 
-    scores = preds
-    if penalty is not None:
-        scores = scores + np.asarray(penalty, dtype=np.float64)[None, :]
-
-    out = pd.DataFrame(scores, columns=list(alg_cols))
-    out.insert(0, "Repetition", test_ds.repetitions)
-    out.insert(0, "Instance", test_ds.instance_ids)
-    out.insert(0, "Dim", test_ds.dims)
-    out.insert(0, "Problem", test_ds.problem_ids)
-    out.attrs["tb_history"] = tb_history
-
-    try:
-        out.attrs["cat_accuracy"] = _cat_accuracy_table(
-            problem_ids=test_ds.problem_ids,
-            dims=test_ds.dims,
-            cat_prob=cat_prob_np,
-            cat_true=cat_true_np,
-            cat_tau=float(cat_tau),
-        ).round(6).to_dict(orient="split")
-        out.attrs["cat_tau"] = float(cat_tau)
-    except Exception:
-        pass
+    out = _prediction_frame_from_scores(
+        scores=preds,
+        test_ds=test_ds,
+        alg_cols=alg_cols,
+        attrs={"tb_history": tb_history},
+    )
 
     del model
     torch.cuda.empty_cache()
     return out
+
+
+def _train_predict_from_datasets(
+    *,
+    train_ds: Dataset,
+    test_ds: Dataset,
+    alg_cols: Sequence[str],
+    make_model: Callable[[], nn.Module],
+    device: torch.device,
+    batch_size: int,
+    num_epochs: int,
+    lr: float,
+    weight_decay: float,
+    num_workers: int,
+    loader_seed_base: int,
+    pbar_head: str,
+    tb_log_dir: Optional[str],
+    tb_run_name: Optional[str],
+    tb_log_val: bool,
+    val_ratio: float,
+    early_stopping_patience: int,
+    head_2_loss_weight: float = 0.5,
+    head_2_score_weight: float = 0.5,
+    penalty: Optional[np.ndarray] = None,
+    lam_prior: float = 0.5,
+) -> pd.DataFrame:
+    base_scores = _train_base_scores_from_datasets(
+        train_ds=train_ds,
+        test_ds=test_ds,
+        alg_cols=alg_cols,
+        make_model=make_model,
+        device=device,
+        batch_size=batch_size,
+        num_epochs=num_epochs,
+        lr=lr,
+        weight_decay=weight_decay,
+        num_workers=num_workers,
+        loader_seed_base=loader_seed_base,
+        pbar_head=pbar_head,
+        tb_log_dir=tb_log_dir,
+        tb_run_name=tb_run_name,
+        tb_log_val=tb_log_val,
+        val_ratio=val_ratio,
+        early_stopping_patience=early_stopping_patience,
+        head_2_loss_weight=head_2_loss_weight,
+        head_2_score_weight=head_2_score_weight,
+    )
+    return materialize_prediction_frame(
+        base_scores,
+        alg_cols=alg_cols,
+        prior=penalty,
+        lam_prior=float(lam_prior),
+        tail_scale=1.0,
+        verbose=True,
+    )
 
 
 def _train_predict_one_split(
@@ -927,13 +1115,10 @@ def _train_predict_one_split(
     cache_test: bool,
     strict: bool,
     target_scale: str = "log",
-    cat_loss_weight: float = 15.0,
-    cat_tau: float = 0.5,
-    cat_penalty: float = 15.0,
-    use_tail_penalty: bool = False,
-    tail_lam_cap: float = 15.0,
-    tail_lam_thr: float = 3.0,
-    tail_scale: float = 1.0,
+    head_2_target_scale: Optional[str] = None,
+    head_2_loss_weight: float = 0.5,
+    head_2_score_weight: float = 0.5,
+    sigmoid_log_s: float = 3.0,
     pbar_head: str = "[train]",
     tb_log_dir: Optional[str] = None,
     tb_run_name: Optional[str] = None,
@@ -942,6 +1127,22 @@ def _train_predict_one_split(
     early_stopping_patience: int = 15,
 ) -> pd.DataFrame:
     alg_cols = list(df_train.columns[2:])
+    target_scale = _resolve_target_scale(target_scale)
+    head_2_target_scale = _resolve_target_scale(head_2_target_scale, fallback=target_scale)
+
+    def _resolve_target_bounds(scale: str) -> Tuple[Optional[float], Optional[float]]:
+        if scale not in TARGET_SCALES_NEED_BOUNDS:
+            return None, None
+        target_values = pd.concat(
+            [df_train.loc[:, alg_cols], df_test.loc[:, alg_cols]],
+            axis=0,
+            ignore_index=True,
+        ).to_numpy(dtype=np.float32, copy=False)
+        return float(np.min(target_values)), float(np.max(target_values))
+
+    target_min, target_max = _resolve_target_bounds(target_scale)
+    head_2_target_min, head_2_target_max = _resolve_target_bounds(head_2_target_scale)
+    sigmoid_log_s = float(sigmoid_log_s)
 
     train_ds = MultiViewNPZDataset(
         df_train,
@@ -951,7 +1152,14 @@ def _train_predict_one_split(
         cache=cache_train,
         strict=strict,
         k_views=k_views,
-        target_scale=str(target_scale),
+        target_scale=target_scale,
+        target_min=target_min,
+        target_max=target_max,
+        sigmoid_log_s=sigmoid_log_s,
+        head_2_target_scale=head_2_target_scale,
+        head_2_target_min=head_2_target_min,
+        head_2_target_max=head_2_target_max,
+        head_2_sigmoid_log_s=sigmoid_log_s,
     )
     test_ds = MultiViewNPZDataset(
         df_test,
@@ -961,19 +1169,17 @@ def _train_predict_one_split(
         cache=cache_test,
         strict=strict,
         k_views=k_views,
-        target_scale=str(target_scale),
+        target_scale=target_scale,
+        target_min=target_min,
+        target_max=target_max,
+        sigmoid_log_s=sigmoid_log_s,
+        head_2_target_scale=head_2_target_scale,
+        head_2_target_min=head_2_target_min,
+        head_2_target_max=head_2_target_max,
+        head_2_sigmoid_log_s=sigmoid_log_s,
     )
 
-    penalty: Optional[np.ndarray] = None
-    if use_tail_penalty:
-        df_tail_train = tail_table(df_train)
-        penalty = float(tail_scale) * compute_risk_penalty(
-            df_tail_train,
-            lam_cap=float(tail_lam_cap),
-            lam_thr=float(tail_lam_thr),
-        )
-
-    return _train_predict_from_datasets(
+    return _train_base_scores_from_datasets(
         train_ds=train_ds,
         test_ds=test_ds,
         alg_cols=alg_cols,
@@ -991,10 +1197,8 @@ def _train_predict_one_split(
         tb_log_val=tb_log_val,
         val_ratio=float(val_ratio),
         early_stopping_patience=int(early_stopping_patience),
-        cat_loss_weight=float(cat_loss_weight),
-        cat_tau=float(cat_tau),
-        cat_penalty=float(cat_penalty),
-        penalty=penalty,
+        head_2_loss_weight=float(head_2_loss_weight),
+        head_2_score_weight=float(head_2_score_weight),
     )
 
 def run_random_split(
@@ -1016,6 +1220,11 @@ def run_random_split(
     cache_train: bool = False,
     cache_test: bool = False,
     strict: bool = True,
+    target_scale: str = "log",
+    head_2_target_scale: Optional[str] = None,
+    head_2_loss_weight: float = 0.5,
+    head_2_score_weight: float = 0.5,
+    target_transform_scale: float = 1.2,
     seed: int = 42,
     tb_log_dir: Optional[str] = None,
     tb_log_val: bool = False,
@@ -1056,6 +1265,10 @@ def run_random_split(
         cache=False,
         strict=strict,
         k_views=k_views,
+        target_scale=target_scale,
+        sigmoid_log_s=float(target_transform_scale),
+        head_2_target_scale=head_2_target_scale,
+        head_2_sigmoid_log_s=float(target_transform_scale),
     )
     n_cases = len(base_ds)
     if n_cases < 2:
@@ -1133,9 +1346,8 @@ def run_random_split(
             tb_log_val=tb_log_val,
             val_ratio=float(val_ratio),
             early_stopping_patience=int(early_stopping_patience),
-            cat_loss_weight=15.0,
-            cat_tau=0.5,
-            cat_penalty=15.0,
+            head_2_loss_weight=float(head_2_loss_weight),
+            head_2_score_weight=float(head_2_score_weight),
             penalty=None,
         )
 
@@ -1173,6 +1385,11 @@ def run_leave_problem_out(
     cache_train: bool = False,
     cache_test: bool = False,
     strict: bool = True,
+    target_scale: str = "log",
+    head_2_target_scale: Optional[str] = None,
+    head_2_loss_weight: float = 0.5,
+    head_2_score_weight: float = 0.5,
+    target_transform_scale: float = 1.2,
     seed: int = 42,
     tb_log_dir: Optional[str] = None,
     tb_log_val: bool = False,
@@ -1233,6 +1450,11 @@ def run_leave_problem_out(
             cache_train=cache_train,
             cache_test=cache_test,
             strict=strict,
+            target_scale=target_scale,
+            head_2_target_scale=head_2_target_scale,
+            head_2_loss_weight=float(head_2_loss_weight),
+            head_2_score_weight=float(head_2_score_weight),
+            sigmoid_log_s=float(target_transform_scale),
             pbar_head=f"[train LPO {fold_idx+1}/{len(test_probs)}]",
             tb_log_dir=tb_log_dir,
             tb_run_name=f"lpo/{test_prob}",
@@ -1268,6 +1490,11 @@ def run_leave_instance_out(
     cache_train: bool = False,
     cache_test: bool = False,
     strict: bool = True,
+    target_scale: str = "log",
+    head_2_target_scale: Optional[str] = None,
+    head_2_loss_weight: float = 0.5,
+    head_2_score_weight: float = 0.5,
+    target_transform_scale: float = 1.2,
     seed: int = 42,
     tb_log_dir: Optional[str] = None,
     tb_log_val: bool = False,
@@ -1298,6 +1525,10 @@ def run_leave_instance_out(
             cache=cache_train,
             strict=strict,
             k_views=k_views,
+            target_scale=target_scale,
+            sigmoid_log_s=float(target_transform_scale),
+            head_2_target_scale=head_2_target_scale,
+            head_2_sigmoid_log_s=float(target_transform_scale),
         )
         test_ds = MultiViewNPZDataset(
             df,
@@ -1307,6 +1538,10 @@ def run_leave_instance_out(
             cache=cache_test,
             strict=strict,
             k_views=k_views,
+            target_scale=target_scale,
+            sigmoid_log_s=float(target_transform_scale),
+            head_2_target_scale=head_2_target_scale,
+            head_2_sigmoid_log_s=float(target_transform_scale),
         )
 
         out = _train_predict_from_datasets(
@@ -1327,9 +1562,8 @@ def run_leave_instance_out(
             tb_log_val=tb_log_val,
             val_ratio=float(val_ratio),
             early_stopping_patience=int(early_stopping_patience),
-            cat_loss_weight=15.0,
-            cat_tau=0.5,
-            cat_penalty=15.0,
+            head_2_loss_weight=float(head_2_loss_weight),
+            head_2_score_weight=float(head_2_score_weight),
             penalty=None,
         )
         out.attrs["cv_protocol"] = "leave_instance_out"
@@ -1360,6 +1594,7 @@ def output_results(
     df: pd.DataFrame,
     dict_df_predictions: Dict[str, pd.DataFrame],
     protocol: Optional[str] = None,
+    print_fold_summary: bool = True,
 ) -> Dict[str, Any]:
     """
     Compute evaluation summaries from per-fold prediction DataFrames.
@@ -1374,25 +1609,15 @@ def output_results(
     - scores: mean true relERT achieved by the picked algorithm
     - median_scores: median true relERT achieved by the picked algorithm (computed on concatenation of all folds)
     - p90_scores: 90th percentile true relERT achieved by the picked algorithm (computed on concatenation of all folds)
-    - log_scores: mean log(relERT) achieved by the picked algorithm
-    - log_median_scores: median log(relERT) achieved by the picked algorithm (computed on concatenation of all folds)
-    - log_p90_scores: 90th percentile log(relERT) achieved by the picked algorithm (computed on concatenation of all folds)
     - accuracies: exact-match accuracy vs the true best algorithm
     - f1: macro-F1 over algorithms
-    - pick_rate: algorithm pick frequency (from the first fold)
+    - pick_rate: algorithm pick frequency
     - vbs_pick_rate: oracle pick frequency (true best algorithm distribution)
     - sbs: SBS (single best solver) true relERT baseline
     - vbs: VBS (virtual best solver) true relERT baseline
     - gap_closure: VBS–SBS gap closure of the model selection
-    - median_sbs: SBS baseline using median aggregation (computed on concatenation of all folds)
-    - median_vbs: VBS baseline using median aggregation (computed on concatenation of all folds)
-    - median_gap_closure: gap closure using median AS/SBS/VBS (computed on concatenation of all folds)
-    - p90_sbs: SBS baseline using 90th percentile aggregation (computed on concatenation of all folds)
-    - p90_vbs: VBS baseline using 90th percentile aggregation (computed on concatenation of all folds)
-    - p90_gap_closure: gap closure using p90 AS/SBS/VBS (computed on concatenation of all folds)
-    - log_sbs/log_vbs/log_gap_closure: mean log(relERT) SBS/VBS/gap-closure tables
-    - log_median_sbs/log_median_vbs/log_median_gap_closure: median log(relERT) SBS/VBS/gap-closure tables
-    - log_p90_sbs/log_p90_vbs/log_p90_gap_closure: p90 log(relERT) SBS/VBS/gap-closure tables
+    - median_sbs/median_vbs/median_gap_closure
+    - p90_sbs/p90_vbs/p90_gap_closure
     """
     alg_cols = list(df.columns[2:])
 
@@ -1422,26 +1647,12 @@ def output_results(
     perf_by_key = df_gt.set_index(["Problem", "Dim"])[alg_cols]
     true_best_alg = perf_by_key.idxmin(axis=1).rename("true_alg")
 
-    def _metric_space(values: np.ndarray, *, use_log: bool) -> np.ndarray:
-        values = np.asarray(values, dtype=float)
-        if not use_log:
-            return values
-        return np.log(np.maximum(values, 1e-6))
-
     # SBS definition (global): choose ONE algorithm over the entire dataset `df`.
     # Then report its performance on each subgroup/dimension subset.
     perf_all = perf_by_key.to_numpy(dtype=float)
-    perf_all_log = _metric_space(perf_all, use_log=True)
     sbs_alg_idx_global = int(np.argmin(np.mean(perf_all, axis=0)))
-    log_sbs_alg_idx_global = int(np.argmin(np.mean(perf_all_log, axis=0)))
-    # SBS algorithm should be defined concistently
     sbs_alg_idx_med_global = sbs_alg_idx_global
     sbs_alg_idx_p90_global = sbs_alg_idx_global
-    log_sbs_alg_idx_med_global = log_sbs_alg_idx_global
-    log_sbs_alg_idx_p90_global = log_sbs_alg_idx_global
-    # sbs_alg_idx_med_global = int(np.argmin(np.median(perf_all, axis=0)))
-    # # p90-SBS (global): choose algorithm minimizing the 90th percentile relERT.
-    # sbs_alg_idx_p90_global = int(np.argmin(np.quantile(perf_all, 0.9, axis=0)))
 
     # BBOB groups
     group_defs = [
@@ -1467,20 +1678,6 @@ def output_results(
     dict_df_sbs: Dict[str, pd.DataFrame] = {}
     dict_df_vbs: Dict[str, pd.DataFrame] = {}
     dict_df_gap: Dict[str, pd.DataFrame] = {}
-    dict_df_log_scores: Dict[str, pd.DataFrame] = {}
-    dict_df_log_sbs: Dict[str, pd.DataFrame] = {}
-    dict_df_log_vbs: Dict[str, pd.DataFrame] = {}
-    dict_df_log_gap: Dict[str, pd.DataFrame] = {}
-
-    # Extract catastrophe-accuracy payloads (if present) before we sanitize attrs.
-    dict_df_cat_acc: Dict[str, pd.DataFrame] = {}
-    for fold_id, preds in dict_df_predictions.items():
-        payload = getattr(preds, "attrs", {}).get("cat_accuracy")
-        if isinstance(payload, dict) and {"columns", "data"}.issubset(payload.keys()):
-            try:
-                dict_df_cat_acc[fold_id] = pd.DataFrame(payload["data"], columns=payload["columns"])
-            except Exception:
-                pass
 
     for fold_id, preds in dict_df_predictions.items():
         preds = preds.copy()
@@ -1493,13 +1690,10 @@ def output_results(
 
         # True relERT row for each sample, then pick the column of the predicted algorithm.
         perf_rows = perf_by_key.loc[keys].to_numpy(dtype=float)
-        perf_rows_log = _metric_space(perf_rows, use_log=True)
         pred_idx = pd.Series(pred_alg).map(col_to_idx).to_numpy(dtype=int)
         picked_score = perf_rows[np.arange(len(perf_rows)), pred_idx]
-        picked_score_log = perf_rows_log[np.arange(len(perf_rows_log)), pred_idx]
 
         sbs_alg_idx = sbs_alg_idx_global
-        log_sbs_alg_idx = log_sbs_alg_idx_global
 
         true_alg = true_best_alg.loc[keys].to_numpy()
         correct = (pred_alg == true_alg)
@@ -1519,10 +1713,6 @@ def output_results(
         sbs_scores = np.full((len(all_dims), len(group_names)), np.nan, dtype=float)
         vbs_scores = np.full((len(all_dims), len(group_names)), np.nan, dtype=float)
         gap_closure = np.full((len(all_dims), len(group_names)), np.nan, dtype=float)
-        log_performances = np.full((len(all_dims), len(group_names)), np.nan, dtype=float)
-        log_sbs_scores = np.full((len(all_dims), len(group_names)), np.nan, dtype=float)
-        log_vbs_scores = np.full((len(all_dims), len(group_names)), np.nan, dtype=float)
-        log_gap_closure = np.full((len(all_dims), len(group_names)), np.nan, dtype=float)
         dims_arr = preds["Dim"].to_numpy()
 
         for di, dval in enumerate(all_dims):
@@ -1550,20 +1740,6 @@ def output_results(
                 else:
                     gap_closure[di, gi] = (sbs - as_score) / denom
 
-                subset_perf_log = perf_rows_log[m]
-                as_score_log = float(np.mean(picked_score_log[m]))
-                vbs_log = float(np.mean(np.min(subset_perf_log, axis=1)))
-                sbs_log = float(np.mean(subset_perf_log[:, log_sbs_alg_idx]))
-                log_performances[di, gi] = as_score_log
-                log_vbs_scores[di, gi] = vbs_log
-                log_sbs_scores[di, gi] = sbs_log
-
-                denom_log = (sbs_log - vbs_log)
-                if abs(denom_log) <= 1e-12:
-                    log_gap_closure[di, gi] = 1.0 if abs(as_score_log - vbs_log) <= 1e-12 else 0.0
-                else:
-                    log_gap_closure[di, gi] = (sbs_log - as_score_log) / denom_log
-
         df_scores = pd.DataFrame(performances, columns=group_names)
         df_scores.insert(0, "Dim", all_dims)
         df_acc = pd.DataFrame(accuracies, columns=group_names)
@@ -1576,32 +1752,15 @@ def output_results(
         df_vbs.insert(0, "Dim", all_dims)
         df_gap = pd.DataFrame(gap_closure, columns=group_names)
         df_gap.insert(0, "Dim", all_dims)
-        df_log_scores = pd.DataFrame(log_performances, columns=group_names)
-        df_log_scores.insert(0, "Dim", all_dims)
-        df_log_sbs = pd.DataFrame(log_sbs_scores, columns=group_names)
-        df_log_sbs.insert(0, "Dim", all_dims)
-        df_log_vbs = pd.DataFrame(log_vbs_scores, columns=group_names)
-        df_log_vbs.insert(0, "Dim", all_dims)
-        df_log_gap = pd.DataFrame(log_gap_closure, columns=group_names)
-        df_log_gap.insert(0, "Dim", all_dims)
 
-        # Keep the same print behaviour as before (overall == last row/col)
-        print(
-            "Fold-local overall for",
-            fold_id,
-            ", score:",
-            round(float(df_scores.loc[df_scores.index[-1], "all"]), 3),
-            ", SBS:",
-            round(float(df_sbs.loc[df_sbs.index[-1], "all"]), 3),
-            ", VBS:",
-            round(float(df_vbs.loc[df_vbs.index[-1], "all"]), 3),
-            ", gap_closure:",
-            round(float(df_gap.loc[df_gap.index[-1], "all"]), 3),
-            ", accuracy:",
-            round(float(df_acc.loc[df_acc.index[-1], "all"]), 3),
-            ", F1:",
-            round(float(df_f1.loc[df_f1.index[-1], "all"]), 3),
-        )
+        if print_fold_summary:
+            as_mean = float(np.mean(picked_score))
+            as_median = float(np.median(picked_score))
+            as_p90 = float(np.quantile(picked_score, 0.9))
+            print(
+                f"Fold-local overall for {fold_id}, "
+                f"AS mean: {as_mean:.3f}, AS median: {as_median:.3f}, AS P90: {as_p90:.3f}"
+            )
 
         dict_df_scores[fold_id] = df_scores.round(3)
         dict_df_accuracies[fold_id] = df_acc.round(3)
@@ -1609,16 +1768,11 @@ def output_results(
         dict_df_sbs[fold_id] = df_sbs.round(3)
         dict_df_vbs[fold_id] = df_vbs.round(3)
         dict_df_gap[fold_id] = df_gap.round(3)
-        dict_df_log_scores[fold_id] = df_log_scores.round(3)
-        dict_df_log_sbs[fold_id] = df_log_sbs.round(3)
-        dict_df_log_vbs[fold_id] = df_log_vbs.round(3)
-        dict_df_log_gap[fold_id] = df_log_gap.round(3)
 
     def _compute_sbs_vbs_on_full_df(
         *,
         use_median: bool = False,
         quantile: Optional[float] = None,
-        metric_space: str = "raw",
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """Compute SBS/VBS baselines on the full ground-truth df (protocol-invariant).
 
@@ -1634,26 +1788,16 @@ def output_results(
                 raise ValueError(f"quantile must be in [0,1], got {quantile}")
             if use_median:
                 raise ValueError("use_median and quantile are mutually exclusive")
-        metric_space = str(metric_space).lower().strip()
-        if metric_space not in {"raw", "log"}:
-            raise ValueError(f"metric_space must be 'raw' or 'log', got {metric_space!r}")
         gt = perf_by_key.reset_index().copy()  # columns: Problem, Dim, <alg...>
         gt["Problem"] = gt["Problem"].astype(str).str.lower()
         gt["Dim"] = gt["Dim"].astype(int)
 
         perf = gt[alg_cols].to_numpy(dtype=float)
-        perf_metric = _metric_space(perf, use_log=(metric_space == "log"))
-
-        if metric_space == "log":
-            if quantile is not None:
-                sbs_alg_idx = int(log_sbs_alg_idx_p90_global)
-            else:
-                sbs_alg_idx = int(log_sbs_alg_idx_med_global) if use_median else int(log_sbs_alg_idx_global)
+        perf_metric = perf
+        if quantile is not None:
+            sbs_alg_idx = int(sbs_alg_idx_p90_global)
         else:
-            if quantile is not None:
-                sbs_alg_idx = int(sbs_alg_idx_p90_global)
-            else:
-                sbs_alg_idx = int(sbs_alg_idx_med_global) if use_median else int(sbs_alg_idx_global)
+            sbs_alg_idx = int(sbs_alg_idx_med_global) if use_median else int(sbs_alg_idx_global)
 
         fid = gt["Problem"].str.extract(r"(\d+)", expand=False).astype(int).to_numpy()
         group = np.full(fid.shape, "all", dtype=object)
@@ -1733,22 +1877,31 @@ def output_results(
         return _avg_over_folds({"concat": df_scores_concat.round(3)})
 
     df_avg_scores = _avg_over_folds(dict_df_scores)
-    df_log_avg_scores = _avg_over_folds(dict_df_log_scores)
-    # raise
     df_avg_accuracies = _avg_over_folds(dict_df_accuracies)
     df_avg_f1 = _avg_over_folds(dict_df_f1)
-
-    # Catastrophe recognition accuracies (extracted earlier from attrs payloads)
-    df_avg_cat_acc: Optional[pd.DataFrame] = None
-    if dict_df_cat_acc:
-        df_avg_cat_acc = _avg_over_folds(dict_df_cat_acc)
-    # Compute SBS/VBS baselines on the full ground-truth df (protocol-invariant).
-    df_sbs_full, df_vbs_full = _compute_sbs_vbs_on_full_df(use_median=False)
-    df_avg_sbs = _avg_over_folds({"full": df_sbs_full})
+    df_avg_sbs = _avg_over_folds(dict_df_sbs)
+    # Keep VBS protocol-invariant; relERT VBS is 1.0 row-wise.
+    _, df_vbs_full = _compute_sbs_vbs_on_full_df(use_median=False)
     df_avg_vbs = _avg_over_folds({"full": df_vbs_full})
-    df_log_sbs_full, df_log_vbs_full = _compute_sbs_vbs_on_full_df(use_median=False, metric_space="log")
-    df_log_avg_sbs = _avg_over_folds({"full": df_log_sbs_full})
-    df_log_avg_vbs = _avg_over_folds({"full": df_log_vbs_full})
+
+    preds_all = pd.concat([p.copy() for p in dict_df_predictions.values()], ignore_index=True).copy()
+    preds_all.attrs = {}
+    preds_all["Problem"] = preds_all["Problem"].astype(str).str.lower()
+    preds_all["Dim"] = preds_all["Dim"].astype(int)
+
+    pred_alg_all = preds_all[alg_cols].idxmin(axis=1).to_numpy()
+    all_keys = pd.MultiIndex.from_frame(preds_all[["Problem", "Dim"]])
+    perf_rows_all = perf_by_key.loc[all_keys].to_numpy(dtype=float)
+    pred_idx_all = pd.Series(pred_alg_all).map(col_to_idx).to_numpy(dtype=int)
+    picked_score_all = perf_rows_all[np.arange(len(perf_rows_all)), pred_idx_all]
+    sbs_score_all = perf_rows_all[:, int(sbs_alg_idx_global)]
+
+    fid_all = preds_all["Problem"].str.extract(r"(\d+)", expand=False).astype(int).to_numpy()
+    group_all = np.full(fid_all.shape, "all", dtype=object)
+    for name, lo, hi in group_defs:
+        group_all[(fid_all >= lo) & (fid_all <= hi)] = name
+
+    dims_all_arr = preds_all["Dim"].to_numpy()
 
     # Recompute gap closure using the averaged scores table and concatenated baselines.
     def _gap_from_tables(df_scores: pd.DataFrame, df_sbs: pd.DataFrame, df_vbs: pd.DataFrame) -> pd.DataFrame:
@@ -1773,54 +1926,23 @@ def output_results(
         return df_gap.rename(columns={"index": "Problem Group"}).round(3)
 
     df_avg_gap_closure = _gap_from_tables(df_avg_scores, df_avg_sbs, df_avg_vbs)
-    df_log_avg_gap_closure = _gap_from_tables(df_log_avg_scores, df_log_avg_sbs, df_log_avg_vbs)
-
-    preds_all = pd.concat([p.copy() for p in dict_df_predictions.values()], ignore_index=True).copy()
-    preds_all.attrs = {}
-    preds_all["Problem"] = preds_all["Problem"].astype(str).str.lower()
-    preds_all["Dim"] = preds_all["Dim"].astype(int)
 
     # Median score on the concatenation (treat all held-out cases together).
-    pred_alg_all = preds_all[alg_cols].idxmin(axis=1).to_numpy()
-    all_keys = pd.MultiIndex.from_frame(preds_all[["Problem", "Dim"]])
-    perf_rows_all = perf_by_key.loc[all_keys].to_numpy(dtype=float)
-    perf_rows_all_log = _metric_space(perf_rows_all, use_log=True)
-    pred_idx_all = pd.Series(pred_alg_all).map(col_to_idx).to_numpy(dtype=int)
-    picked_score_all = perf_rows_all[np.arange(len(perf_rows_all)), pred_idx_all]
-    picked_score_all_log = perf_rows_all_log[np.arange(len(perf_rows_all_log)), pred_idx_all]
-
-    fid_all = preds_all["Problem"].str.extract(r"(\d+)", expand=False).astype(int).to_numpy()
-    group_all = np.full(fid_all.shape, "all", dtype=object)
-    for name, lo, hi in group_defs:
-        group_all[(fid_all >= lo) & (fid_all <= hi)] = name
-
-    dims_all_arr = preds_all["Dim"].to_numpy()
     df_median_scores = _compute_concat_scores_df(picked_score_all, use_median=True)
-    df_log_median_scores = _compute_concat_scores_df(picked_score_all_log, use_median=True)
 
-    # Median baselines are computed on the full ground-truth df (protocol-invariant).
-    df_median_sbs_full, df_median_vbs_full = _compute_sbs_vbs_on_full_df(use_median=True)
-    df_median_sbs = _avg_over_folds({"full": df_median_sbs_full})
+    # Keep the global SBS identity, but evaluate it on the duplicated held-out population.
+    df_median_sbs = _compute_concat_scores_df(sbs_score_all, use_median=True)
+    _, df_median_vbs_full = _compute_sbs_vbs_on_full_df(use_median=True)
     df_median_vbs = _avg_over_folds({"full": df_median_vbs_full})
     df_median_gap_closure = _gap_from_tables(df_median_scores, df_median_sbs, df_median_vbs)
-    df_log_median_sbs_full, df_log_median_vbs_full = _compute_sbs_vbs_on_full_df(use_median=True, metric_space="log")
-    df_log_median_sbs = _avg_over_folds({"full": df_log_median_sbs_full})
-    df_log_median_vbs = _avg_over_folds({"full": df_log_median_vbs_full})
-    df_log_median_gap_closure = _gap_from_tables(df_log_median_scores, df_log_median_sbs, df_log_median_vbs)
 
     # 90th percentile (p90) score on the concatenation (treat all held-out cases together).
     df_p90_scores = _compute_concat_scores_df(picked_score_all, quantile=0.9)
-    df_log_p90_scores = _compute_concat_scores_df(picked_score_all_log, quantile=0.9)
 
-    # p90 baselines are computed on the full ground-truth df (protocol-invariant).
-    df_p90_sbs_full, df_p90_vbs_full = _compute_sbs_vbs_on_full_df(quantile=0.9)
-    df_p90_sbs = _avg_over_folds({"full": df_p90_sbs_full})
+    df_p90_sbs = _compute_concat_scores_df(sbs_score_all, quantile=0.9)
+    _, df_p90_vbs_full = _compute_sbs_vbs_on_full_df(quantile=0.9)
     df_p90_vbs = _avg_over_folds({"full": df_p90_vbs_full})
     df_p90_gap_closure = _gap_from_tables(df_p90_scores, df_p90_sbs, df_p90_vbs)
-    df_log_p90_sbs_full, df_log_p90_vbs_full = _compute_sbs_vbs_on_full_df(quantile=0.9, metric_space="log")
-    df_log_p90_sbs = _avg_over_folds({"full": df_log_p90_sbs_full})
-    df_log_p90_vbs = _avg_over_folds({"full": df_log_p90_vbs_full})
-    df_log_p90_gap_closure = _gap_from_tables(df_log_p90_scores, df_log_p90_sbs, df_log_p90_vbs)
 
     pick_rate = preds_all[alg_cols].idxmin(axis=1).value_counts(normalize=True).sort_values(ascending=False)
     vbs_pick_rate = true_best_alg.loc[all_keys].value_counts(normalize=True).sort_values(ascending=False)
@@ -1829,33 +1951,19 @@ def output_results(
         "scores": df_avg_scores,
         "median_scores": df_median_scores,
         "p90_scores": df_p90_scores,
-        "log_scores": df_log_avg_scores,
-        "log_median_scores": df_log_median_scores,
-        "log_p90_scores": df_log_p90_scores,
         "accuracies": df_avg_accuracies,
         "accuracies_by_fold": dict_df_accuracies,
-        "cat_accuracies": df_avg_cat_acc,
-        "cat_accuracies_by_fold": dict_df_cat_acc,
         "f1": df_avg_f1,
         "pick_rate": pick_rate,
         "vbs_pick_rate": vbs_pick_rate,
         "sbs": df_avg_sbs,
         "vbs": df_avg_vbs,
         "gap_closure": df_avg_gap_closure,
-        "log_sbs": df_log_avg_sbs,
-        "log_vbs": df_log_avg_vbs,
-        "log_gap_closure": df_log_avg_gap_closure,
         "median_sbs": df_median_sbs,
         "median_vbs": df_median_vbs,
         "median_gap_closure": df_median_gap_closure,
-        "log_median_sbs": df_log_median_sbs,
-        "log_median_vbs": df_log_median_vbs,
-        "log_median_gap_closure": df_log_median_gap_closure,
         "p90_sbs": df_p90_sbs,
         "p90_vbs": df_p90_vbs,
         "p90_gap_closure": df_p90_gap_closure,
-        "log_p90_sbs": df_log_p90_sbs,
-        "log_p90_vbs": df_log_p90_vbs,
-        "log_p90_gap_closure": df_log_p90_gap_closure,
         "preds_all": preds_all,
     }

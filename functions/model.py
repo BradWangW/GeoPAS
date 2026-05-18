@@ -2,7 +2,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class ContourCNNSelector(nn.Module):
+
+def _make_head(width: int, num_algorithms: int) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Linear(width, 256),
+        nn.ReLU(),
+        nn.Linear(256, 128),
+        nn.ReLU(),
+        nn.Linear(128, num_algorithms),
+    )
+
+class GeoPAS(nn.Module):
     def __init__(self, num_algorithms, *, dual_head: bool = True, conv_channels=[32, 64, 128]):
         super().__init__()
 
@@ -13,23 +23,17 @@ class ContourCNNSelector(nn.Module):
 
         self.plot_attn = PlotAttention(conv_channels[-1] + 16)
 
-        self.dim_embed = nn.Linear(1, 1)
+        self.dim_embed = nn.Linear(1, 4)
 
         self.pre_head_dropout = nn.Dropout(p=0.2)
 
-        self.head = nn.Sequential(
-            nn.Linear(conv_channels[-1] + 16 + 1, 128),
-            nn.ReLU(),
-            nn.Linear(128, num_algorithms)
-        )
+        D = conv_channels[-1] + 16 + 4
 
-        self.cat_head = None
+        self.head = _make_head(D, num_algorithms)
+
+        self.head_2 = None
         if self.dual_head:
-            self.cat_head = nn.Sequential(
-                nn.Linear(conv_channels[-1] + 16 + 1, 128),
-                nn.ReLU(),
-                nn.Linear(128, num_algorithms)
-            )
+            self.head_2 = _make_head(D, num_algorithms)
 
     def forward(self, plots, masks, stats, dim):
         """
@@ -40,7 +44,7 @@ class ContourCNNSelector(nn.Module):
         """
         B, K, _, _ = plots.shape
 
-        plots = plots.view(B * K, 1, plots.size(-2), plots.size(-1))
+        plots = plots.view(B * K, 1, plots.size(-2), plots.size(-1)) - 0.5
         masks = masks.view(B * K, 1, masks.size(-2), masks.size(-1))
 
         z = self.encoder(plots, masks)           # (B*K, conv_channels[-1])
@@ -61,21 +65,33 @@ class ContourCNNSelector(nn.Module):
         Z = self.pre_head_dropout(Z)
 
         out = self.head(Z)  # (B,num_algorithms)
-        cat_logits = self.cat_head(Z) if self.cat_head is not None else None
-        return out, cat_logits
+        out_head_2 = self.head_2(Z) if self.head_2 is not None else None
+        return out, out_head_2
+
 
 class PlotAttention(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim: int):
         super().__init__()
         self.score = nn.Linear(dim, 1)
 
-    def forward(self, z):
+    def forward(self, z, view_mask=None):
         """
         z: (B, K, D)
+        view_mask: (B, K) bool, True for real plots, False for padded plots
         """
-        logits = self.score(z).squeeze(-1)     # (B,K)
+        logits = self.score(z).squeeze(-1)  # (B, K)
+
+        if view_mask is not None:
+            logits = logits.masked_fill(~view_mask, -1e9)
+
         weights = torch.softmax(logits, dim=1)
+
+        if view_mask is not None:
+            weights = weights * view_mask.to(weights.dtype)
+            weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-6)
+
         return (z * weights.unsqueeze(-1)).sum(dim=1)
+
 
 class PlotEncoder(nn.Module):
     def __init__(self, conv_channels=[32, 64, 128]):
@@ -88,22 +104,33 @@ class PlotEncoder(nn.Module):
 
     def forward(self, x, mask):
         """
-        x:    (B, 1, r, r)
-        mask: (B, 1, r, r)
+        x:    (B, 1, r, r), plots normalised to [0, 1]
+        mask: (B, 1, r, r), values in {0,1}
         """
+        mask = mask.float()
+
+        # Recenter around 0.5, then hard-mask invalid pixels to zero.
+        # This preserves the "0.5 is neutral filler" idea while ensuring
+        # invalid pixels carry no objective signal into the CNN.
+        x = (x - 0.5) * mask
+
         x = self.block1(x)
+        x = x * mask
         x, mask = masked_downsample(x, mask)
 
         x = self.block2(x)
+        x = x * mask
         x, mask = masked_downsample(x, mask)
 
         x = self.block3(x)
+        x = x * mask
 
-        z = self.spatial_pool(x, mask)   # (B, conv_channels[2])
+        z = self.spatial_pool(x, mask)   # (B, 128)
         return z
-    
+
+
 class MaskedSpatialAttention(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, channels: int):
         super().__init__()
         self.attn = nn.Conv2d(channels, 1, kernel_size=1)
 
@@ -114,9 +141,9 @@ class MaskedSpatialAttention(nn.Module):
         """
         B, C, H, W = x.shape
 
-        logits = self.attn(x)                  # (B,1,H,W)
-        logits = logits.flatten(-2)            # (B,1,HW)
-        mask_f = mask.flatten(-2)              # (B,1,HW)
+        logits = self.attn(x)                      # (B, 1, H, W)
+        logits = logits.flatten(-2)               # (B, 1, HW)
+        mask_f = mask.flatten(-2)                 # (B, 1, HW)
 
         # Mask invalid positions
         logits = logits.masked_fill(mask_f == 0, -1e9)
@@ -125,16 +152,17 @@ class MaskedSpatialAttention(nn.Module):
         weights = torch.softmax(logits, dim=-1)
         weights = weights * mask_f
 
-        # Renormalise to avoid NaNs when few valid pixels exist
+        # Renormalise for numerical safety
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
 
         weights = weights.view(B, 1, H, W)
 
-        pooled = (x * weights).sum(dim=(-2, -1))  # (B,C)
+        pooled = (x * weights).sum(dim=(-2, -1))  # (B, C)
         return pooled
 
+
 class ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
+    def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
@@ -144,7 +172,8 @@ class ConvBlock(nn.Module):
         x = F.relu(self.conv2(x))
         return x
 
+
 def masked_downsample(x, mask, kernel_size=2, stride=2):
-    x    = F.max_pool2d(x,    kernel_size, stride)
+    x = F.max_pool2d(x, kernel_size, stride)
     mask = F.max_pool2d(mask, kernel_size, stride)
     return x, mask
